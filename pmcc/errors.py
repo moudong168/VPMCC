@@ -1,0 +1,2 @@
+class DataQualityError(RuntimeError):
+    pass

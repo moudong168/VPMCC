@@ -1,0 +1,53 @@
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+
+# Local Futu/OpenD runtime logs and app data
+.runtime-appdata/
+**/com.futunn.FutuOpenD/
+*.log
+*.log.*
+
+# Private portfolio snapshots and local position memory
+pmcc_last_positions.json
+pmcc_*_positions.json
+pmcc_iv_history.json
+pmcc_iv_rank_memory.json
+pmcc_report.html
+pmcc_trade_journal.jsonl
+pmcc_trade_journal.csv
+obsidian_notes/
+*_last_positions.json
+positions*.json
+holdings*.json
+portfolio*.json
+account*.json
+
+# Local market/account/runtime data exports
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.pkl
+*.pickle
+*.h5
+*.tmp
+*.bak
+*.local
+
+# Local environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

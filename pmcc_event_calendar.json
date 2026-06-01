@@ -1,0 +1,16 @@
+{
+  "US.NVDA": [
+    {
+      "type": "earnings",
+      "date": "2026-05-20",
+      "time": "after_market",
+      "description": "NVIDIA Q1 FY2027 earnings after market close. Manually confirmed from TipRanks and Wall Street Horizon on 2026-05-20.",
+      "source": "manual_confirmed",
+      "verified_sources": [
+        "https://www.tipranks.com/stocks/nvda/earnings",
+        "https://www.wallstreethorizon.com/nvidia-earnings-calendar"
+      ],
+      "updated_at": "2026-05-20"
+    }
+  ]
+}
