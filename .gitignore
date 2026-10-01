@@ -13,6 +13,7 @@ pmcc_last_positions.json
 pmcc_*_positions.json
 pmcc_iv_history.json
 pmcc_iv_rank_memory.json
+pmcc_csv_state.json
 pmcc_report.html
 pmcc_trade_journal.jsonl
 pmcc_trade_journal.csv

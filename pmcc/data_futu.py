@@ -117,6 +117,9 @@ def get_option_chain(symbol: str, ctx: Any, config: Optional[StrategyConfig] = N
         except TypeError as exc:
             errors.append(f"{kwargs}: TypeError({exc})")
             continue
+        except Exception as exc:
+            errors.append(f"{kwargs}: {type(exc).__name__}({exc})")
+            continue
         if ret == RET_OK and data is not None and not data.empty:
             chains.append(normalize_option_chain(data))
             continue
@@ -135,6 +138,9 @@ def get_option_chain(symbol: str, ctx: Any, config: Optional[StrategyConfig] = N
             ret, data = ctx.get_option_chain(**kwargs)
         except TypeError as exc:
             errors.append(f"{kwargs}: TypeError({exc})")
+            continue
+        except Exception as exc:
+            errors.append(f"{kwargs}: {type(exc).__name__}({exc})")
             continue
         if ret == RET_OK and data is not None and not data.empty:
             return normalize_option_chain(data)
@@ -160,6 +166,10 @@ def get_greeks(codes: List[str], ctx: Any) -> pd.DataFrame:
         else:
             errors.append(format_futu_error(ret, data))
 
+    # Chunk-level errors (non-fatal when other chunks succeeded)
+    for err in errors:
+        print(f"WARNING: get_greeks chunk failure: {err}")
+
     if not snapshots:
         if hasattr(ctx, "get_option_greeks"):
             ret, data = ctx.get_option_greeks(codes)
@@ -184,6 +194,8 @@ def get_greeks(codes: List[str], ctx: Any) -> pd.DataFrame:
         "last_price": "last_price",
         "volume": "volume",
     }
+    for target in field_map.values():
+        greeks[target] = float("nan")
     for source, target in field_map.items():
         if source in snapshot.columns:
             greeks[target] = snapshot[source]
@@ -206,7 +218,8 @@ def get_daily_klines(symbol: str, ctx: Any, bars: int) -> pd.DataFrame:
 
     try:
         ret, data, _ = ctx.request_history_kline(symbol, ktype=KLType.K_DAY, max_count=max(bars, 60))
-    except Exception:
+    except Exception as exc:
+        print(f"WARNING: request_history_kline failed for {symbol}: {exc}")
         return pd.DataFrame()
     if ret == RET_OK and data is not None and not data.empty:
         return data.copy()
@@ -322,7 +335,8 @@ def collect_positions_from_opend(
         position_side = safe_text(row.get("position_side")) or ""
         position_side_upper = position_side.upper()
         if not position_side_upper:
-            position_side_upper = "SHORT" if raw_quantity < 0 else "LONG"
+            print(f"WARNING: position_side missing for {code} (qty={raw_quantity}), defaulting to SHORT. Verify manually.")
+            position_side_upper = "SHORT"
         cost_price = safe_float(row.get("average_cost"))
         if cost_price is None:
             cost_price = safe_float(row.get("cost_price"))

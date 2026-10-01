@@ -1,4 +1,5 @@
 import re
+from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
 from pmcc.models import PositionInput
@@ -112,3 +113,26 @@ def group_positions_by_underlying(positions: List[PositionInput]) -> Dict[str, L
     for item in positions:
         grouped.setdefault(item.underlying, []).append(item)
     return grouped
+
+
+def combine_positions_by_code(*position_lists: List[PositionInput]) -> List[PositionInput]:
+    combined: Dict[str, PositionInput] = {}
+    for positions in position_lists:
+        for position in positions:
+            key = position.raw_code.upper()
+            if key not in combined:
+                combined[key] = position
+                continue
+            existing = combined[key]
+            total_quantity = existing.quantity + position.quantity
+            if total_quantity <= 0:
+                combined.pop(key, None)
+                continue
+            if existing.cost_price is not None and position.cost_price is not None:
+                cost_price = (existing.cost_price * existing.quantity + position.cost_price * position.quantity) / total_quantity
+            elif existing.cost_price == position.cost_price:
+                cost_price = existing.cost_price
+            else:
+                cost_price = None
+            combined[key] = replace(existing, quantity=total_quantity, cost_price=cost_price)
+    return list(combined.values())
