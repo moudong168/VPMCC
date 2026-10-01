@@ -246,7 +246,7 @@ class StrategyCoreTests(unittest.TestCase):
             self.assertIn("test&lt;branch&gt;", header)
             self.assertIn("<strong>4</strong>", header)
             css = pmcc_reports.html_report_css()
-            self.assertIn(".wrap", css)
+            self.assertIn(".report-shell", css)
             self.assertIn("@media", css)
             self.assertIn("本次持仓确认", pmcc_reports.html_positions_section([["US.NVDA"]], [], [], []))
             self.assertIn("平台分组总览", pmcc_reports.html_overview_section([["Futu", "US.NVDA"]], ["risk-green"]))
@@ -1301,7 +1301,7 @@ class StrategyCoreTests(unittest.TestCase):
             path = Path(handle.name)
 
         try:
-            bases, shorts, metadata = pmcc.parse_tos_position_statement(path)
+            bases, shorts, metadata = pmcc.parse_tos_position_statement(Path(f" {path} "))
         finally:
             path.unlink(missing_ok=True)
 
@@ -1842,7 +1842,7 @@ class StrategyCoreTests(unittest.TestCase):
             cost_price=4.19,
         )
 
-        def fake_analyze(symbol: str, bases, shorts, config, portfolio_identity=None):
+        def fake_analyze(symbol: str, bases, shorts, config, portfolio_identity=None, use_cboe=False):
             if symbol == "US.MSFT":
                 return {
                     "symbol": symbol,
@@ -1906,7 +1906,7 @@ class StrategyCoreTests(unittest.TestCase):
             cost_price=3.74,
         )
 
-        def fake_analyze(symbol: str, bases, shorts, config, portfolio_identity=None):
+        def fake_analyze(symbol: str, bases, shorts, config, portfolio_identity=None, use_cboe=False):
             return {
                 "symbol": symbol,
                 "base_positions": [{"code": item.raw_code} for item in bases],
