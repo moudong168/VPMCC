@@ -61,7 +61,7 @@ class CsvPositionsTests(unittest.TestCase):
 
     def test_parse_futu_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = self._write(Path(tmp), "持仓-保证金综合账户(9123)-20260929-221417.csv", FUTU_SAMPLE)
+            path = self._write(Path(tmp), "持仓-保证金综合账户(XXXX)-20260929-221417.csv", FUTU_SAMPLE)
             base, shorts, meta = parse_futu_position_csv(path)
         # stocks skipped, strategy row skipped, zero-qty skipped
         self.assertEqual(len(base), 1)
@@ -83,8 +83,8 @@ class CsvPositionsTests(unittest.TestCase):
             root = Path(tmp)
             self._write(root, "2026-09-28-PositionStatement.csv", SCHWAB_SAMPLE)
             newest_schwab = self._write(root, "2026-09-29-PositionStatement.csv", SCHWAB_SAMPLE)
-            self._write(root, "持仓-保证金综合账户(9123)-20260928-101010.csv", FUTU_SAMPLE)
-            newest_futu = self._write(root, "持仓-保证金综合账户(9123)-20260929-221417.csv", FUTU_SAMPLE)
+            self._write(root, "持仓-保证金综合账户(XXXX)-20260928-101010.csv", FUTU_SAMPLE)
+            newest_futu = self._write(root, "持仓-保证金综合账户(XXXX)-20260929-221417.csv", FUTU_SAMPLE)
             found = find_latest_position_csvs(root)
         self.assertEqual(found["schwab"], newest_schwab)
         self.assertEqual(found["futu"], newest_futu)

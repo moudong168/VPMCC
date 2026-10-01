@@ -5,7 +5,7 @@ Each run scans a directory for the latest exported position CSVs:
 - Schwab: ``*PositionStatement.csv`` / ``*PositionStatement.txt``
   (thinkorswim Position Statement export, date embedded in the filename)
 - Futu: ``持仓-*.csv`` (Futu 保证金综合账户 position export,
-  datetime embedded in the filename, e.g. ``持仓-保证金综合账户(9123)-20260929-221417.csv``)
+  datetime embedded in the filename, e.g. ``持仓-保证金综合账户(XXXX)-20260929-221417.csv``)
 
 When a CSV newer than the last run is found it becomes the position source
 and the saved JSON snapshots are refreshed. When no new CSV is available,
