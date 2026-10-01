@@ -55,7 +55,7 @@ def html_table(headers: List[str], rows: List[List[Any]], row_classes: Optional[
         cells = "".join(f"<td>{html_text(cell)}</td>" for cell in row)
         body_rows.append(f"<tr{klass}>{cells}</tr>")
     body = "\n".join(body_rows) if body_rows else f"<tr><td colspan=\"{len(headers)}\" class=\"empty\">无</td></tr>"
-    return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+    return f'<div class="table-scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
 def explain_trend(trend: Any) -> str:
@@ -73,6 +73,11 @@ def explain_action(action: Any) -> str:
         "PREPARE_DEFENSE": "short put 开始准备防守",
         "TAKE_PROFIT": "short put 达到止盈回补目标",
         "REVIEW": "复核 short put 风险",
+        "HOLD": "持有装袋，等待止盈或到期",
+        "BUY_TO_CLOSE_OR_ROLL_NEW_CYCLE": "买回平仓或滚动到新周期",
+        "CONSIDER_BUY_TO_CLOSE": "可考虑买回平仓",
+        "PREPARE_ROLL_DOWN_OUT": "准备向下/向外滚动",
+        "REVIEW_HOLD_OR_CLOSE": "复核：持有还是平仓",
     }
     if str(action) in short_put_actions:
         return short_put_actions[str(action)]
@@ -186,6 +191,12 @@ def short_call_risk_light(review: Dict[str, Any]) -> Tuple[str, str]:
         return "YELLOW", "plan/watch"
     if action in {"HOLD_DECAY", "MONITOR"}:
         return "GREEN", "hold"
+    if action == "BUY_TO_CLOSE_OR_ROLL_NEW_CYCLE":
+        return "YELLOW", "plan roll/close"
+    if action == "PREPARE_ROLL_DOWN_OUT":
+        return "ORANGE", "prepare roll down"
+    if action == "REVIEW_HOLD_OR_CLOSE":
+        return "YELLOW", "review hold/close"
     return "GRAY", "unknown"
 
 
@@ -202,7 +213,7 @@ def short_put_risk_light(review: Dict[str, Any]) -> Tuple[str, str]:
         return "ORANGE", "put defense prep"
     if action == "REVIEW" or (abs_delta is not None and abs_delta >= 0.20) or (otm_pct is not None and otm_pct <= 10):
         return "YELLOW", "put review"
-    if action in {"MONITOR", "TAKE_PROFIT"}:
+    if action in {"MONITOR", "TAKE_PROFIT", "HOLD", "CONSIDER_BUY_TO_CLOSE"}:
         return "GREEN", "hold"
     return "GRAY", "unknown"
 
@@ -651,46 +662,6 @@ def build_short_put_operation_advice(review: Dict[str, Any]) -> str:
     return f"{code} 操作建议：继续持有，不急着 roll。"
 
 
-def build_chinese_summary(result: Dict[str, Any]) -> str:
-    if "error" in result:
-        return f"{result.get('symbol', '标的')} 分析失败：{result['error']}"
-
-    option = result.get("suggested_option", {})
-    action_text_map = {
-        "WAIT": "暂时观望",
-        "CONSIDER_SELL": "可考虑卖出 short call",
-        "SELL_CALL": "适合卖出 short call",
-        "SELL_CALL_WEAK": "适合偏保守地卖出 short call",
-        "AVOID_SELL": "暂不建议卖出 short call",
-    }
-    parts = [
-        f"{result['symbol']} 当前价格约为 {result.get('price')}",
-        f"趋势判断为 {result.get('trend')}",
-        f"主建议是：{action_text_map.get(result.get('action'), result.get('action'))}",
-    ]
-    if option.get("code"):
-        parts.append(f"候选 short call 为 {option['code']}，执行价 {option.get('strike')}，距离到期约 {option.get('days_to_expiry')} 天")
-    reviews = result.get("short_call_reviews", [])
-    if reviews:
-        roll_action_text_map = {
-            "MONITOR": "继续观察",
-            "HOLD_DECAY": "继续吃时间价值",
-            "PLAN_ROLL": "开始规划 roll",
-            "PREPARE_ROLL": "可提前准备 roll",
-            "ROLL_UP_OUT": "适合向上并向外 roll",
-            "ROLL_NOW": "建议尽快 roll",
-            "TAKE_PROFIT_AND_RESELL": "可止盈后重新卖出",
-            "DEFEND": "进入防守区，需要重点盯盘",
-            "REVIEW_EXPIRY": "接近到期，需复核是否移仓",
-        }
-        review_text = "；".join(
-            f"{item['code']}：{roll_action_text_map.get(item['roll_action'], item['roll_action'])}"
-            for item in reviews
-        )
-        parts.append(f"现有 short call 处理建议：{review_text}")
-    return "。".join(parts) + "。"
-
-
 def build_chinese_summary_clean(result: Dict[str, Any]) -> str:
     if "error" in result:
         return f"{result.get('symbol', '标的')} 分析失败：{result['error']}"
@@ -811,11 +782,6 @@ def format_symbol_human(symbol_result: Dict[str, Any], position_result: Optional
                     f"- {leaps_code}: {iv_detail}LEAPS strike {leaps_strike}; expiry {leaps_expiry}; cost {leaps_cost}; "
                     f"minimum safe short strike {safe_strike}; {status}."
                 )
-                continue
-                lines.append(
-                    f"- {leaps_code}: LEAPS strike {leaps_strike}，到期 {leaps_expiry}，成本 {leaps_cost}；"
-                    f"最低安全 short strike {safe_strike}；{status}。"
-                )
 
     lines.append(f"主结论：{explain_action(symbol_result.get('action'))}。")
 
@@ -855,7 +821,7 @@ def format_symbol_human(symbol_result: Dict[str, Any], position_result: Optional
 
     put_reviews = symbol_result.get("short_put_reviews", [])
     if put_reviews:
-        lines.append("Short put / cash-secured put:")
+        lines.append("已卖 Short Put / CSP：")
         for item in put_reviews:
             wheel_state = item.get("wheel_state") or {}
             lines.append(
@@ -867,12 +833,12 @@ def format_symbol_human(symbol_result: Dict[str, Any], position_result: Optional
             )
             if wheel_state:
                 lines.append(
-                    f"  Wheel state: {wheel_state.get('state')}; action: {wheel_state.get('action')}; "
-                    f"priority: {wheel_state.get('priority')}; next trigger: {wheel_state.get('next_check_trigger')}"
+                    f"  wheel 状态： {wheel_state.get('state')}; action: {wheel_state.get('action')}; "
+                    f"priority: {wheel_state.get('priority')}; 下一个触发条件： {wheel_state.get('next_check_trigger')}"
                 )
             close_target = item.get("close_target_50pct")
             if close_target is not None:
-                lines.append(f"  50% buyback target: {format_value(close_target, 2)}.")
+                lines.append(f"  50% 止盈回补价： {format_value(close_target, 2)}.")
             advice_text = item.get("operation_advice_text") or build_short_put_operation_advice(item)
             if advice_text:
                 lines.append(f"  {advice_text}")
@@ -890,7 +856,7 @@ def format_symbol_human(symbol_result: Dict[str, Any], position_result: Optional
                     )
             roll_candidates = item.get("roll_candidates") or []
             if roll_candidates:
-                lines.append("  Short put roll candidates:")
+                lines.append("  short put 滚动候选：")
                 for candidate in roll_candidates[:3]:
                     net_text = "net unknown"
                     if candidate.get("estimated_net_debit") is not None:
@@ -977,7 +943,7 @@ def build_html_report(
   <style>{css}</style>
 </head>
 <body>
-  <main class="wrap">
+  <main class="report-shell">
     {html_report_header(generated_at, report_version, source, len(recommendations))}
 
     {position_sections}
@@ -1091,52 +1057,233 @@ def html_report_header(
 
 def html_report_css() -> str:
     return """
-    :root { color-scheme: light; --bg:#f6f7f9; --panel:#ffffff; --text:#172033; --muted:#667085; --line:#d9dee8; --blue:#1f5eff; --red:#b42318; --orange:#b54708; --yellow:#8a6100; --green:#067647; --gray:#475467; }
+    :root {
+      color-scheme: light;
+      --bg:#eef3f8;
+      --bg-strong:#dfe8f1;
+      --panel:#ffffff;
+      --panel-soft:#f8fafc;
+      --text:#172033;
+      --muted:#64748b;
+      --line:#d7e0eb;
+      --line-strong:#b8c6d8;
+      --blue:#2463eb;
+      --blue-dark:#173f91;
+      --red:#b42318;
+      --red-bg:#fff1f0;
+      --orange:#b54708;
+      --orange-bg:#fff7ed;
+      --yellow:#8a6100;
+      --yellow-bg:#fffbeb;
+      --green:#067647;
+      --green-bg:#ecfdf3;
+      --gray:#475467;
+      --gray-bg:#f2f4f7;
+      --shadow:0 18px 48px rgba(22, 37, 64, .10);
+      --shadow-soft:0 8px 22px rgba(22, 37, 64, .07);
+    }
     * { box-sizing: border-box; }
-    body { margin:0; font-family: "Segoe UI", Arial, sans-serif; background:var(--bg); color:var(--text); }
-    .wrap { max-width: 1280px; margin: 0 auto; padding: 28px; }
-    header { display:flex; justify-content:space-between; gap:24px; align-items:flex-start; margin-bottom:22px; }
-    h1 { margin:0 0 8px; font-size:30px; letter-spacing:0; }
-    h2 { margin:0 0 14px; font-size:20px; }
-    h3 { margin:18px 0 8px; font-size:15px; }
-    h4 { margin:14px 0 6px; font-size:13px; color:var(--muted); }
+    html { background:var(--bg); }
+    body {
+      margin:0;
+      font-family:"Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+      background:
+        linear-gradient(180deg, rgba(36,99,235,.12), rgba(36,99,235,0) 340px),
+        radial-gradient(circle at 8% 0%, rgba(20,184,166,.13), transparent 340px),
+        var(--bg);
+      color:var(--text);
+      font-size:14px;
+      line-height:1.55;
+      overflow-x:hidden;
+    }
+    .report-shell { max-width: 1480px; margin: 0 auto; padding: 32px 28px 44px; }
+    header {
+      display:grid;
+      grid-template-columns:minmax(320px, 1fr) minmax(520px, 700px);
+      gap:24px;
+      align-items:stretch;
+      margin-bottom:24px;
+      padding:26px;
+      border:1px solid rgba(36,99,235,.18);
+      border-radius:8px;
+      background:linear-gradient(135deg, #ffffff 0%, #f8fbff 58%, #edf5ff 100%);
+      box-shadow:var(--shadow);
+    }
+    h1 { margin:0 0 10px; font-size:34px; line-height:1.12; letter-spacing:0; color:#10233f; }
+    h2 { margin:0 0 14px; font-size:21px; line-height:1.25; color:#172033; }
+    h3 { margin:22px 0 9px; font-size:15px; line-height:1.3; color:#243b5a; }
+    h4 {
+      margin:18px 0 8px;
+      font-size:12px;
+      letter-spacing:.06em;
+      color:var(--muted);
+      text-transform:uppercase;
+    }
     .subtitle, .muted { color:var(--muted); }
-    .kpis { display:grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap:12px; min-width:560px; }
-    .kpi, .card, .platform-ledger { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:16px; box-shadow:0 1px 2px rgba(16,24,40,.04); }
-    .kpi span { display:block; color:var(--muted); font-size:13px; }
-    .kpi strong { display:block; font-size:26px; margin-top:6px; }
-    .grid { display:grid; grid-template-columns: 1fr; gap:18px; }
-    table { width:100%; border-collapse:collapse; background:var(--panel); border:1px solid var(--line); border-radius:8px; overflow:hidden; }
-    th, td { padding:11px 12px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; font-size:14px; }
-    th { background:#eef2f8; color:#344054; font-weight:650; }
+    .subtitle { font-size:13px; line-height:1.7; }
+    .kpis { display:grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap:12px; min-width:0; }
+    .kpi {
+      min-height:108px;
+      background:rgba(255,255,255,.78);
+      border:1px solid rgba(36,99,235,.16);
+      border-radius:8px;
+      padding:15px;
+      box-shadow:0 8px 20px rgba(36,99,235,.08);
+    }
+    .kpi span { display:block; color:var(--muted); font-size:12px; font-weight:650; }
+    .kpi strong { display:block; font-size:31px; line-height:1; margin-top:14px; color:var(--blue-dark); }
+    .grid { display:grid; grid-template-columns: 1fr; gap:20px; }
+    table {
+      width:100%;
+      border-collapse:separate;
+      border-spacing:0;
+      background:var(--panel);
+      border:1px solid var(--line);
+      border-radius:8px;
+      overflow:hidden;
+      box-shadow:0 1px 0 rgba(15,23,42,.03);
+    }
+    .table-scroll {
+      width:100%;
+      max-width:100%;
+      overflow-x:auto;
+      border-radius:8px;
+      -webkit-overflow-scrolling:touch;
+    }
+    th, td {
+      padding:10px 12px;
+      border-bottom:1px solid var(--line);
+      text-align:left;
+      vertical-align:top;
+      font-size:13px;
+      line-height:1.45;
+    }
+    th {
+      position:sticky;
+      top:0;
+      z-index:1;
+      background:linear-gradient(180deg, #f7fbff, #edf4fb);
+      color:#334155;
+      font-size:12px;
+      font-weight:750;
+      white-space:nowrap;
+      border-bottom:1px solid var(--line-strong);
+    }
+    td { color:#26364d; }
+    td:first-child, th:first-child { padding-left:14px; }
     tr.group-row.group-0 td { background:#ffffff; }
-    tr.group-row.group-1 td { background:#f8fafc; }
+    tr.group-row.group-1 td { background:#f8fbff; }
     tr.group-row + tr.group-row.group-0 td, tr.group-row + tr.group-row.group-1 td { border-top:1px solid #d5dce8; }
     tr.group-row.group-0 + tr.group-row.group-0 td, tr.group-row.group-1 + tr.group-row.group-1 td { border-top:0; }
-    tr.group-row:hover td { background:#eef6ff; }
+    tr:hover td { background:#f0f7ff; }
     tr:last-child td { border-bottom:0; }
-    tr.risk-red td:first-child { color:var(--red); font-weight:700; }
-    tr.risk-orange td:first-child { color:var(--orange); font-weight:700; }
-    tr.risk-yellow td:first-child { color:var(--yellow); font-weight:700; }
-    tr.risk-green td:first-child { color:var(--green); font-weight:700; }
-    tr.risk-gray td:first-child { color:var(--gray); font-weight:700; }
-    .section { margin:18px 0; }
-    .section-title { display:flex; align-items:center; justify-content:space-between; margin:0 0 10px; }
-    .platform-ledger { border-top:3px solid var(--blue); }
-    .platform-ledger + .platform-ledger { margin-top:24px; }
-    .metrics { display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }
-    .metrics span { background:#f2f4f7; border:1px solid var(--line); border-radius:6px; padding:8px 10px; }
-    .event-banner, .validation-banner { border:1px solid var(--line); border-left-width:6px; border-radius:8px; padding:12px 14px; font-weight:700; }
-    .event-blocked, .validation-warn { background:#fff1f0; border-color:#fecdca; border-left-color:var(--red); color:var(--red); }
-    .event-attention, .validation-attention { background:#fff7ed; border-color:#fed7aa; border-left-color:var(--orange); color:var(--orange); }
-    .event-normal, .validation-ok { background:#f2f4f7; border-color:var(--line); border-left-color:var(--gray); color:var(--gray); font-weight:600; }
-    .validation-unavailable { background:#fffbeb; border-color:#fde68a; border-left-color:var(--yellow); color:var(--yellow); }
-    .summary { line-height:1.6; }
-    details { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px 16px; }
-    summary { cursor:pointer; font-weight:650; }
+    tr.risk-red td { background:var(--red-bg); }
+    tr.risk-orange td { background:var(--orange-bg); }
+    tr.risk-yellow td { background:var(--yellow-bg); }
+    tr.risk-green td { background:var(--green-bg); }
+    tr.risk-gray td { background:var(--gray-bg); }
+    tr.risk-red td:first-child, tr.risk-orange td:first-child, tr.risk-yellow td:first-child, tr.risk-green td:first-child, tr.risk-gray td:first-child {
+      position:relative;
+      font-weight:800;
+    }
+    tr.risk-red td:first-child { color:var(--red); box-shadow:inset 5px 0 0 var(--red); }
+    tr.risk-orange td:first-child { color:var(--orange); box-shadow:inset 5px 0 0 var(--orange); }
+    tr.risk-yellow td:first-child { color:var(--yellow); box-shadow:inset 5px 0 0 var(--yellow); }
+    tr.risk-green td:first-child { color:var(--green); box-shadow:inset 5px 0 0 var(--green); }
+    tr.risk-gray td:first-child { color:var(--gray); box-shadow:inset 5px 0 0 var(--gray); }
+    .section {
+      margin:22px 0;
+      padding:20px;
+      background:rgba(255,255,255,.72);
+      border:1px solid rgba(184,198,216,.72);
+      border-radius:8px;
+      box-shadow:var(--shadow-soft);
+    }
+    .section > h2:first-child, .section-title h2 { margin-bottom:0; }
+    .section-title {
+      display:flex;
+      align-items:flex-end;
+      justify-content:space-between;
+      gap:18px;
+      margin:0 0 14px;
+      padding-bottom:12px;
+      border-bottom:1px solid var(--line);
+    }
+    .platform-ledger {
+      border-color:rgba(36,99,235,.26);
+      border-top:4px solid var(--blue);
+      background:rgba(255,255,255,.88);
+    }
+    .platform-ledger + .platform-ledger { margin-top:26px; }
+    .card {
+      background:var(--panel);
+      border:1px solid var(--line);
+      border-radius:8px;
+      padding:22px;
+      box-shadow:var(--shadow-soft);
+    }
+    .card h2 {
+      display:flex;
+      align-items:center;
+      gap:10px;
+      padding-bottom:12px;
+      border-bottom:1px solid var(--line);
+    }
+    .summary { line-height:1.75; color:#334155; }
+    .metrics {
+      display:grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap:10px;
+      margin-top:14px;
+    }
+    .metrics span {
+      min-height:62px;
+      background:var(--panel-soft);
+      border:1px solid var(--line);
+      border-radius:8px;
+      padding:10px 12px;
+      color:var(--muted);
+    }
+    .metrics strong { display:block; margin-top:3px; color:#172033; font-weight:750; }
+    ul { margin:8px 0 0; padding-left:20px; }
+    li + li { margin-top:5px; }
+    .event-banner, .validation-banner {
+      border:1px solid var(--line);
+      border-left-width:6px;
+      border-radius:8px;
+      padding:12px 14px;
+      font-weight:750;
+    }
+    .event-blocked, .validation-warn { background:var(--red-bg); border-color:#fecdca; border-left-color:var(--red); color:var(--red); }
+    .event-attention, .validation-attention { background:var(--orange-bg); border-color:#fed7aa; border-left-color:var(--orange); color:var(--orange); }
+    .event-normal, .validation-ok { background:var(--gray-bg); border-color:var(--line); border-left-color:var(--gray); color:var(--gray); font-weight:650; }
+    .validation-unavailable { background:var(--yellow-bg); border-color:#fde68a; border-left-color:var(--yellow); color:var(--yellow); }
+    details { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px 16px; box-shadow:var(--shadow-soft); }
+    summary { cursor:pointer; font-weight:700; color:#243b5a; }
     pre { white-space:pre-wrap; word-break:break-word; font-size:12px; color:#101828; }
-    .empty { color:var(--muted); text-align:center; }
-    @media (max-width: 760px) { .wrap { padding:16px; } header { display:block; } .kpis { grid-template-columns:1fr; min-width:0; margin-top:16px; } table { display:block; overflow-x:auto; } }
+    .empty { color:var(--muted); text-align:center; background:#f8fafc; }
+    @media (max-width: 980px) {
+      .report-shell { padding:20px 14px 32px; }
+      header { grid-template-columns:1fr; padding:20px; }
+      .kpis { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+      .section { padding:16px; }
+      .section-title { align-items:flex-start; flex-direction:column; gap:4px; }
+      .table-scroll table { min-width:760px; }
+      th { position:static; }
+    }
+    @media (max-width: 560px) {
+      h1 { font-size:28px; }
+      .kpis { grid-template-columns:1fr; }
+      .kpi { min-height:auto; }
+      .metrics { grid-template-columns:1fr; }
+      th, td { padding:9px 10px; font-size:12px; }
+    }
+    @media print {
+      body { background:#ffffff; }
+      .report-shell { max-width:none; padding:0; }
+      header, .section, .card, details { box-shadow:none; break-inside:avoid; }
+      th { position:static; }
+    }
     """
 
 
