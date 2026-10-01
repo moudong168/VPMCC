@@ -61,13 +61,17 @@ def missing_gitignore_patterns(repo_root: Path) -> list[str]:
 
 
 def tracked_runtime_files(repo_root: Path) -> list[str]:
-    completed = subprocess.run(
-        ["git", "ls-files", "--", *PROTECTED_PATTERNS],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", "--", *PROTECTED_PATTERNS],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        print("WARNING: not a git repository; skipping tracked-runtime-file check.")
+        return []
     return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
 
 

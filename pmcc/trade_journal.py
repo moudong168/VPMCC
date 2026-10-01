@@ -474,8 +474,9 @@ def _open_close_match_key(event: Dict[str, Any]) -> tuple:
 
 
 def _realized_pnl_for_close(close_event: Dict[str, Any], matches: List[Dict[str, Any]]) -> Any:
+    close_identity = _trade_event_identity(close_event)
     for match in matches:
-        if match.get("close_event") is close_event or _trade_event_identity(match.get("close_event") or {}) == _trade_event_identity(close_event):
+        if _trade_event_identity(match.get("close_event") or {}) == close_identity:
             return match.get("realized_pnl")
     return None
 
