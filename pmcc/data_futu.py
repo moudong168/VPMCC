@@ -1,6 +1,7 @@
 import math
 import time
-from typing import Any, List, Optional, Tuple
+from datetime import date, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -10,6 +11,9 @@ from pmcc.positions import parse_option_code_metadata
 from pmcc.utils import parse_expiry, safe_float, safe_text
 
 LAST_OPTION_CHAIN_REQUEST_AT = 0.0
+
+# Safety cap for the paginated Futu daily-IV series (one page is a full year by default).
+MAX_HIS_VOLATILITY_PAGES = 10
 
 
 def format_futu_error(ret: Any, data: Any) -> str:
@@ -246,6 +250,186 @@ def get_trend(symbol: str, ctx: Any, bars: int) -> str:
     if ma_gap < -0.003 and recent_return < -0.005:
         return "DOWN"
     return "FLAT"
+
+
+def fetch_underlying_daily_iv_series(symbol: str, ctx: Any, days: int = 360) -> Dict[str, Any]:
+    """Fetch Futu OpenD's daily implied-volatility series for an underlying.
+
+    Calls ``OpenQuoteContext.get_option_underlying_his_volatility`` and follows
+    ``page_req_key`` until it is exhausted (capped at ``MAX_HIS_VOLATILITY_PAGES``).
+    The official signature is
+    ``get_option_underlying_his_volatility(code, index_option_type=IndexOptionType.NORMAL,
+    begin_time=None, end_time=None, page_req_key=None)``, so every argument after
+    ``code`` MUST be passed by keyword - a positional call silently lands the
+    begin-date string in ``index_option_type`` and the request fails. The requested
+    span is capped at 364 days, the official maximum for this endpoint.
+    The ``iv`` column is already in percent, i.e. the same unit as the locally
+    accumulated PMCC IV history, so no scaling is applied anywhere.
+
+    Returns ``{"values": [...], "start_date": ..., "end_date": ...}`` with values
+    in chronological order. This helper is strictly best-effort and never raises:
+    any failure (no context, non-OK return code, missing columns, empty payload,
+    exception) yields an empty ``values`` list.
+    """
+    result: Dict[str, Any] = {
+        "values": [],
+        "start_date": None,
+        "end_date": None,
+        "rows": 0,
+        "pages": 0,
+        "error": None,
+    }
+    if ctx is None:
+        result["error"] = "missing_quote_context"
+        return result
+
+    try:
+        from futu import RET_OK
+
+        if not hasattr(ctx, "get_option_underlying_his_volatility"):
+            result["error"] = "unsupported_quote_context"
+            return result
+
+        end_day = date.today()
+        # Official maximum span for this endpoint is 364 days; keep the request inside it.
+        span_days = min(max(int(days), 20), 364)
+        begin_day = end_day - timedelta(days=span_days)
+        begin_time = begin_day.isoformat()
+        end_time = end_day.isoformat()
+
+        frames: List[pd.DataFrame] = []
+        page_req_key = None
+        for _ in range(MAX_HIS_VOLATILITY_PAGES):
+            ret, data, page_req_key = ctx.get_option_underlying_his_volatility(
+                symbol,
+                begin_time=begin_time,
+                end_time=end_time,
+                page_req_key=page_req_key,
+            )
+            result["pages"] += 1
+            if ret != RET_OK:
+                if not frames:
+                    result["error"] = format_futu_error(ret, data)
+                    return result
+                break
+            if isinstance(data, pd.DataFrame) and not data.empty:
+                frames.append(data.copy())
+            if not page_req_key:
+                break
+
+        if not frames:
+            return result
+
+        frame = pd.concat(frames, ignore_index=True)
+        if "iv" not in frame.columns:
+            result["error"] = "missing_iv_column"
+            return result
+
+        working = frame.copy()
+        working["iv_numeric"] = pd.to_numeric(working["iv"], errors="coerce")
+        finite_mask = [
+            bool(value is not None and not pd.isna(value) and math.isfinite(float(value)))
+            for value in working["iv_numeric"].tolist()
+        ]
+        working = working[finite_mask].copy()
+        if working.empty:
+            return result
+
+        if "time" in working.columns:
+            working["series_time"] = pd.to_datetime(working["time"], errors="coerce")
+            working = working.sort_values(by=["series_time"], kind="mergesort", na_position="last")
+            known_dates = [value.date().isoformat() for value in working["series_time"].tolist() if not pd.isna(value)]
+        else:
+            known_dates = []
+
+        values = [float(value) for value in working["iv_numeric"].tolist()]
+        result["values"] = values
+        result["rows"] = len(values)
+        result["start_date"] = known_dates[0] if known_dates else None
+        result["end_date"] = known_dates[-1] if known_dates else None
+        return result
+    except Exception as exc:
+        result["values"] = []
+        result["start_date"] = None
+        result["end_date"] = None
+        result["rows"] = 0
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+
+def fetch_underlying_iv_overview(symbol: str, ctx: Any) -> Dict[str, Any]:
+    """Fetch Futu OpenD's direct IV overview for an underlying.
+
+    Calls ``OpenQuoteContext.get_option_underlying_overview([symbol])``, which
+    returns ``(ret, data)`` where ``data`` is a DataFrame with columns such as
+    ``code``, ``name``, ``iv``, ``iv_rank``, ``iv_percentile``, ``pre_iv``,
+    ``hv_30d``. All values are already in PERCENT - the same numbers the Futu app
+    shows in its volatility analysis panel - so this helper never rescales them.
+
+    Returns ``{"iv": float|None, "iv_rank": float|None,
+    "iv_percentile": float|None, "error": str|None}``. This helper is strictly
+    best-effort and never raises: any failure (missing context, unsupported
+    context, non-OK return code, empty payload, missing/non-finite ``iv_rank``,
+    exception) yields ``iv_rank`` ``None`` plus a non-empty ``error`` string.
+    """
+    result: Dict[str, Any] = {
+        "iv": None,
+        "iv_rank": None,
+        "iv_percentile": None,
+        "error": None,
+    }
+    if ctx is None:
+        result["error"] = "missing_quote_context"
+        return result
+
+    try:
+        from futu import RET_OK
+
+        if not hasattr(ctx, "get_option_underlying_overview"):
+            result["error"] = "unsupported_quote_context"
+            return result
+
+        ret, data = ctx.get_option_underlying_overview([symbol])
+        if ret != RET_OK:
+            result["error"] = format_futu_error(ret, data)
+            return result
+        if not isinstance(data, pd.DataFrame) or data.empty:
+            result["error"] = "empty_overview_data"
+            return result
+
+        row = None
+        if "code" in data.columns:
+            matched = data[data["code"] == symbol]
+            if not matched.empty:
+                row = matched.iloc[0]
+        if row is None:
+            row = data.iloc[0]
+
+        def finite_field(field: str) -> Optional[float]:
+            if field not in row.index:
+                return None
+            try:
+                value = float(row[field])
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(value):
+                return None
+            return value
+
+        result["iv"] = finite_field("iv")
+        result["iv_rank"] = finite_field("iv_rank")
+        result["iv_percentile"] = finite_field("iv_percentile")
+        if "iv_rank" not in row.index:
+            result["error"] = "missing_iv_rank_column"
+        elif result["iv_rank"] is None:
+            result["error"] = "non_finite_iv_rank"
+        return result
+    except Exception as exc:
+        result["iv"] = None
+        result["iv_rank"] = None
+        result["iv_percentile"] = None
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        return result
 
 
 def estimate_historical_volatility(symbol: str, ctx: Any, bars: int = 31) -> Optional[float]:

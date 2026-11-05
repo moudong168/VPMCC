@@ -155,6 +155,58 @@ def prompt_short_call_manual_metrics(short_call):
     }
 
 
+def prompt_short_call_metrics_with_auto(short_call_code: str, auto_metrics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Prompt for short-call metrics, reusing values already fetched from Futu OpenD.
+
+    Delta and IV that were auto fetched are offered as confirm-or-override
+    values: pressing Enter keeps the OpenD value, typing a number overrides it.
+    The free-form prompt is only used for fields that could not be auto fetched.
+    Profit captured percent is only prompted for when it cannot be derived from
+    the short call cost price and the current quotes.
+    """
+    auto = auto_metrics or {}
+    auto_delta = safe_float(auto.get("delta"))
+    auto_iv = safe_float(auto.get("iv"))
+    auto_profit_capture = safe_float(auto.get("profit_capture_pct"))
+
+    write_interactive_message(f"\n当前正在补充 short call 数据: {short_call_code}")
+    if auto_delta is not None:
+        write_interactive_message("delta 已从 Futu OpenD 快照自动读取；直接回车沿用，或输入新的 delta 覆盖。")
+        manual_delta = prompt_confirm_or_override_float("short call delta", auto_delta)
+    else:
+        write_interactive_message("delta 说明：")
+        write_interactive_message("- 输入这张 short call 当前的 delta")
+        write_interactive_message("- 示例：0.3173")
+        manual_delta = prompt_optional_float("请输入 short call delta")
+
+    if auto_profit_capture is not None:
+        write_interactive_message(
+            f"profit captured 已按当前平仓 ask 价格自动计算：{auto_profit_capture:.1f}%，本次不需要手动输入。"
+        )
+        profit_capture = auto_profit_capture
+    else:
+        write_interactive_message("profit captured 说明：")
+        write_interactive_message("- 输入这张 short call 已经赚到的利润，占最初最大权利金的百分比")
+        write_interactive_message("- 例如已经赚了一半，就输入 50")
+        write_interactive_message("- 例如已经赚了 70%，就输入 70")
+        profit_capture = prompt_optional_float("请输入 profit captured 百分比")
+
+    if auto_iv is not None:
+        write_interactive_message("IV 已从 Futu OpenD 快照自动读取；直接回车沿用，或输入新的 IV 覆盖。")
+        manual_iv = prompt_confirm_or_override_float("short call IV", auto_iv)
+    else:
+        write_interactive_message("IV 说明：")
+        write_interactive_message("- 输入这张 short call 当前的 implied volatility")
+        write_interactive_message("- 示例：43.7")
+        manual_iv = prompt_optional_float("请输入 short call IV")
+
+    return {
+        "delta": manual_delta,
+        "profit_capture_pct": profit_capture,
+        "iv": manual_iv,
+    }
+
+
 def prompt_iv_rank_value(symbol: str, current_value: Optional[float]) -> Optional[float]:
     label = f"{symbol} 当前 IV Rank"
     try:

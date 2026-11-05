@@ -303,6 +303,9 @@ def summarize_data_validation(validation: Dict[str, Any]) -> str:
 def summarize_iv_rank_analysis(analysis: Dict[str, Any]) -> str:
     if not analysis:
         return "IV Rank source unavailable"
+    # OpenD failures are reported explicitly instead of being swallowed.
+    opend_error = analysis.get("opend_error")
+    opend_error_text = f"; OpenD error: {opend_error}" if opend_error else ""
     if analysis.get("is_true_historical_iv_rank") or analysis.get("is_decision_usable_iv_rank"):
         source = analysis.get("source") or "historical IV"
         count = analysis.get("lookback_count")
@@ -311,7 +314,7 @@ def summarize_iv_rank_analysis(analysis: Dict[str, Any]) -> str:
             updated_at = analysis.get("memory_updated_at")
             age = analysis.get("memory_age_days")
             age_text = f", age {format_value(age, 2)}d" if age is not None else ""
-            return f"same-day manual IV Rank fallback from {updated_at or source}{age_text}"
+            return f"same-day manual IV Rank fallback from {updated_at or source}{age_text}{opend_error_text}"
         proxy_meta = analysis.get("chain_iv_rank_proxy_meta") or {}
         proxy_status = proxy_meta.get("status")
         proxy_text = f"; chain proxy {proxy_status} (not used)" if proxy_status else ""
@@ -323,9 +326,9 @@ def summarize_iv_rank_analysis(analysis: Dict[str, Any]) -> str:
     status = analysis.get("history_status") or "unavailable"
     if proxy is not None:
         sample_text = f", n={sample}" if sample is not None else ""
-        return f"historical IV Rank unavailable ({status}); chain proxy {format_value(proxy, 1)} {proxy_status or ''}{sample_text} excluded from decision"
+        return f"historical IV Rank unavailable ({status}); chain proxy {format_value(proxy, 1)} {proxy_status or ''}{sample_text} excluded from decision{opend_error_text}"
     proxy_text = f"; chain proxy {proxy_status} excluded from decision" if proxy_status else ""
-    return f"historical IV Rank unavailable ({status}){proxy_text}"
+    return f"historical IV Rank unavailable ({status}){proxy_text}{opend_error_text}"
 
 
 def summarize_iv_environment(environment: Dict[str, Any]) -> str:

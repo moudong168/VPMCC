@@ -9,7 +9,7 @@ import sys
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -25,6 +25,7 @@ from pmcc.interaction import (
     prompt_positions_with_memory as prompt_positions_with_memory_from_interaction,
     prompt_required_text as prompt_required_text_from_interaction,
     prompt_short_call_manual_metrics as prompt_short_call_manual_metrics_from_interaction,
+    prompt_short_call_metrics_with_auto as prompt_short_call_metrics_with_auto_from_interaction,
     read_interactive_text,
     write_interactive_message,
 )
@@ -39,6 +40,8 @@ from pmcc.data_quality import build_option_data_quality, require_option_data_qua
 from pmcc.data_futu import (
     collect_positions_from_opend as collect_positions_from_opend_from_futu,
     estimate_historical_volatility,
+    fetch_underlying_daily_iv_series,
+    fetch_underlying_iv_overview,
     format_futu_error,
     get_daily_klines,
     get_greeks,
@@ -71,7 +74,6 @@ from pmcc.reports import (
     explain_trend,
     event_risk_class,
     effective_candidate_capacity,
-    build_chinese_summary,
     build_chinese_summary_clean,
     build_html_report,
     build_short_put_operation_advice,
@@ -137,6 +139,7 @@ from pmcc.strategy import (
     select_option,
 )
 from pmcc.positions import (
+    combine_positions_by_code,
     group_positions_by_underlying,
     parse_option_code_metadata,
     parse_positions_input,
@@ -145,6 +148,17 @@ from pmcc.positions import (
     positions_from_records,
     positions_to_compact_text,
 )
+from pmcc.csv_positions import (
+    SCHWAB_FILENAME_DATE_RE,
+    find_latest_position_csvs,
+    is_new_csv,
+    load_csv_state,
+    parse_futu_position_csv,
+    parse_schwab_position_statement,
+    parse_schwab_position_statement as parse_tos_position_statement,
+    save_csv_state,
+)
+from pmcc.data_cboe import fetch_cboe_data
 from pmcc.utils import parse_expiry, safe_float, safe_int, safe_text, symbol_to_web_ticker
 
 
@@ -169,8 +183,8 @@ def patch_futu_log_makedirs() -> None:
             original_makedirs(name, mode=mode, exist_ok=exist_ok)
         except FileExistsError:
             normalized = os.path.normpath(os.fspath(name))
-            futu_log_suffix = os.path.normpath(os.path.join("com.futunn.FutuOpenD", "Log"))
-            if normalized.endswith(futu_log_suffix):
+            parent, leaf = os.path.split(normalized)
+            if leaf == "Log" and parent and os.path.basename(parent) == "com.futunn.FutuOpenD":
                 return
             raise
 
@@ -178,7 +192,23 @@ def patch_futu_log_makedirs() -> None:
 
 
 patch_futu_log_makedirs()
-from futu import OpenQuoteContext, OptionType, RET_OK, TrdEnv
+try:
+    from futu import OpenQuoteContext, OptionType, RET_OK, TrdEnv
+    FUTU_AVAILABLE = True
+except ImportError:
+    class OpenQuoteContext:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            pass
+        def close(self):
+            pass
+    class OptionType:  # type: ignore
+        CALL = None
+        PUT = None
+    RET_OK = 0  # type: ignore
+    
+    class TrdEnv:  # type: ignore
+        REAL = None
+    FUTU_AVAILABLE = False
 
 
 HOST = "127.0.0.1"
@@ -187,6 +217,7 @@ INTERACTIVE_MODE = False
 MEMORY_FILE = Path(__file__).with_name("pmcc_last_positions.json")
 FUTU_POSITIONS_FILE = Path(__file__).with_name("pmcc_futu_positions.json")
 SCHWAB_POSITIONS_FILE = Path(__file__).with_name("pmcc_schwab_positions.json")
+CSV_STATE_FILE = Path(__file__).with_name("pmcc_csv_state.json")
 IV_HISTORY_FILE = Path(__file__).with_name("pmcc_iv_history.json")
 IV_RANK_MEMORY_FILE = Path(__file__).with_name("pmcc_iv_rank_memory.json")
 EVENT_CALENDAR_FILE = Path(__file__).with_name("pmcc_event_calendar.json")
@@ -418,23 +449,6 @@ def load_position_memory() -> Dict[str, str]:
     return load_position_memory_from_path(MEMORY_FILE)
 
 
-def collect_positions_from_memory() -> Tuple[List[PositionInput], List[PositionInput], Dict[str, Any]]:
-    payload = load_position_memory_payload()
-    memory = load_position_memory()
-    base_raw = memory.get("base_positions", "")
-    short_raw = memory.get("short_calls", "")
-    base_positions = parse_positions_input(base_raw) if base_raw.strip() else []
-    short_calls = parse_positions_input(short_raw) if short_raw.strip() else []
-    return base_positions, short_calls, {
-        "source": "memory",
-        "memory_file": str(MEMORY_FILE),
-        "memory_scope": safe_text(payload.get("memory_scope")) or "legacy_analysis_snapshot",
-        "loaded": bool(base_positions or short_calls),
-        "base_contracts": sum(item.quantity for item in base_positions),
-        "short_call_contracts": sum(item.quantity for item in short_calls),
-    }
-
-
 def save_position_memory(
     base_positions: List[PositionInput],
     short_calls: List[PositionInput],
@@ -466,29 +480,6 @@ def save_broker_positions(path: Path, broker: str, base_positions: List[Position
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
     write_json_object(path, payload)
-
-
-def combine_positions_by_code(*position_lists: List[PositionInput]) -> List[PositionInput]:
-    combined: Dict[str, PositionInput] = {}
-    for positions in position_lists:
-        for position in positions:
-            key = position.raw_code.upper()
-            if key not in combined:
-                combined[key] = position
-                continue
-            existing = combined[key]
-            total_quantity = existing.quantity + position.quantity
-            if total_quantity <= 0:
-                combined.pop(key, None)
-                continue
-            if existing.cost_price is not None and position.cost_price is not None:
-                cost_price = (existing.cost_price * existing.quantity + position.cost_price * position.quantity) / total_quantity
-            elif existing.cost_price == position.cost_price:
-                cost_price = existing.cost_price
-            else:
-                cost_price = None
-            combined[key] = replace(existing, quantity=total_quantity, cost_price=cost_price)
-    return list(combined.values())
 
 
 def subtract_positions_by_code(current_positions: List[PositionInput], removals: List[PositionInput]) -> Tuple[List[PositionInput], List[Dict[str, Any]]]:
@@ -621,100 +612,6 @@ def apply_schwab_position_changes(
     }
 
 
-TOS_MONTHS = {
-    "JAN": "01",
-    "FEB": "02",
-    "MAR": "03",
-    "APR": "04",
-    "MAY": "05",
-    "JUN": "06",
-    "JUL": "07",
-    "AUG": "08",
-    "SEP": "09",
-    "OCT": "10",
-    "NOV": "11",
-    "DEC": "12",
-}
-
-
-def tos_option_code(underlying: str, instrument: str) -> Optional[str]:
-    match = re.match(
-        r"^100\s+(?:\(WEEKLYS\)\s+)?(?P<day>\d{1,2})\s+(?P<month>[A-Z]{3})\s+(?P<year>\d{2})\s+(?P<strike>\d+(?:\.\d+)?)\s+(?P<cp>CALL|PUT)$",
-        instrument.strip().upper(),
-    )
-    if not match:
-        return None
-    month = TOS_MONTHS.get(match.group("month"))
-    if month is None:
-        return None
-    day = int(match.group("day"))
-    strike = float(match.group("strike"))
-    strike_code = f"{int(round(strike * 1000)):06d}"
-    cp = "C" if match.group("cp") == "CALL" else "P"
-    return f"US.{underlying.upper()}{match.group('year')}{month}{day:02d}{cp}{strike_code}"
-
-
-def parse_tos_position_statement(path: Path) -> Tuple[List[PositionInput], List[PositionInput], Dict[str, Any]]:
-    base_positions: List[PositionInput] = []
-    short_positions: List[PositionInput] = []
-    skipped: List[Dict[str, Any]] = []
-    current_underlying: Optional[str] = None
-    rows_seen = 0
-
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.reader(handle)
-        for row in reader:
-            rows_seen += 1
-            if not row:
-                continue
-            instrument = safe_text(row[0])
-            if not instrument or instrument in {"Instrument", "Equities and Equity Options"}:
-                continue
-            qty_text = safe_text(row[1]) if len(row) > 1 else None
-            trade_price = safe_float(row[3]) if len(row) > 3 else None
-
-            if qty_text is None and re.fullmatch(r"[A-Z]{1,6}", instrument):
-                current_underlying = instrument
-                continue
-
-            if not instrument.startswith("100 "):
-                continue
-            if current_underlying is None:
-                skipped.append({"instrument": instrument, "reason": "missing_underlying"})
-                continue
-            quantity_signed = safe_int(qty_text)
-            if quantity_signed is None or quantity_signed == 0:
-                skipped.append({"instrument": instrument, "qty": qty_text, "reason": "zero_or_missing_quantity"})
-                continue
-            code = tos_option_code(current_underlying, instrument)
-            if code is None:
-                skipped.append({"instrument": instrument, "reason": "unsupported_option_format"})
-                continue
-            meta = parse_option_code_metadata(code)
-            position = PositionInput(
-                raw_code=code,
-                underlying=meta["underlying"],
-                quantity=abs(quantity_signed),
-                strike=meta["strike"],
-                expiry=meta["expiry"],
-                option_type=meta["option_type"],
-                cost_price=trade_price,
-            )
-            if quantity_signed > 0 and position.option_type == "CALL":
-                base_positions.append(position)
-            elif quantity_signed < 0:
-                short_positions.append(position)
-            else:
-                skipped.append({"instrument": instrument, "qty": qty_text, "reason": "long_put_not_pmcc_base"})
-
-    return combine_positions_by_code(base_positions), combine_positions_by_code(short_positions), {
-        "source": "thinkorswim_position_statement",
-        "path": str(path),
-        "rows_seen": rows_seen,
-        "base_contracts": sum(item.quantity for item in base_positions),
-        "short_contracts": sum(item.quantity for item in short_positions),
-        "skipped": skipped,
-    }
 
 
 def position_memory_key(position: PositionInput) -> Tuple[str, Optional[float], Optional[str], Optional[str], Optional[float]]:
@@ -725,97 +622,6 @@ def position_memory_key(position: PositionInput) -> Tuple[str, Optional[float], 
         position.option_type,
         position.cost_price,
     )
-
-
-def reconcile_memory_positions_with_opend(
-    memory_base_positions: List[PositionInput],
-    memory_short_calls: List[PositionInput],
-    opend_base_positions: List[PositionInput],
-    opend_short_calls: List[PositionInput],
-) -> Tuple[List[PositionInput], List[PositionInput], Dict[str, Any]]:
-    opend_codes = {item.raw_code.upper() for item in opend_base_positions + opend_short_calls}
-    memory_only_items: List[Tuple[str, PositionInput]] = []
-    retained_base: List[PositionInput] = []
-    retained_short: List[PositionInput] = []
-
-    for position in memory_base_positions:
-        if position.raw_code.upper() in opend_codes:
-            continue
-        memory_only_items.append(("base", position))
-    for position in memory_short_calls:
-        if position.raw_code.upper() in opend_codes:
-            continue
-        memory_only_items.append(("short", position))
-
-    if not memory_only_items:
-        return memory_base_positions, memory_short_calls, {
-            "enabled": True,
-            "memory_only_count": 0,
-            "removed": [],
-            "kept": [],
-        }
-
-    print("")
-    print("========== 本地记忆仓位对账 ==========")
-    print("下面这些仓位存在于 pmcc_last_positions.json，但本次 Futu OpenD 快照没有看到。")
-    print("如果它们已经在 Futu 或其他券商平仓，请输入编号移除；如果仍是非 Futu 持仓，直接回车保留。")
-    print("输入示例：B1,S2；输入 ALL 可全部移除。")
-    index_by_id: Dict[str, Tuple[str, PositionInput]] = {}
-    for index, (bucket, position) in enumerate(memory_only_items, start=1):
-        prefix = "B" if bucket == "base" else "S"
-        item_id = f"{prefix}{index}"
-        index_by_id[item_id] = (bucket, position)
-        label = "LEAPS/base" if bucket == "base" else "short option"
-        print(f"{item_id}: {label}  {format_position_inventory_line(position)}")
-
-    try:
-        raw = read_interactive_text("要从本地记忆中移除的编号（回车=全部保留）: ")
-    except EOFError:
-        raw = ""
-
-    remove_ids: set[str] = set()
-    if raw.upper() == "ALL":
-        remove_ids = set(index_by_id)
-    elif raw:
-        for token in re.split(r"[,;，；\s]+", raw.upper()):
-            if token:
-                if token in index_by_id:
-                    remove_ids.add(token)
-                else:
-                    print(f"忽略无法识别的编号：{token}")
-
-    removed_records: List[Dict[str, Any]] = []
-    kept_records: List[Dict[str, Any]] = []
-    remove_keys = {position_memory_key(index_by_id[item_id][1]) for item_id in remove_ids}
-
-    for position in memory_base_positions:
-        if position.raw_code.upper() in opend_codes:
-            retained_base.append(position)
-            continue
-        if position_memory_key(position) in remove_keys:
-            removed_records.append(position_to_record(position))
-        else:
-            retained_base.append(position)
-            kept_records.append(position_to_record(position))
-
-    for position in memory_short_calls:
-        if position.raw_code.upper() in opend_codes:
-            retained_short.append(position)
-            continue
-        if position_memory_key(position) in remove_keys:
-            removed_records.append(position_to_record(position))
-        else:
-            retained_short.append(position)
-            kept_records.append(position_to_record(position))
-
-    print(f"本次从本地记忆移除 {len(removed_records)} 条；保留 memory-only 仓位 {len(kept_records)} 条。")
-    print("====================================")
-    return retained_base, retained_short, {
-        "enabled": True,
-        "memory_only_count": len(memory_only_items),
-        "removed": removed_records,
-        "kept": kept_records,
-    }
 
 
 def merge_positions_by_code(*sources: Tuple[str, List[PositionInput]]) -> Tuple[List[PositionInput], Dict[str, Any]]:
@@ -1495,6 +1301,7 @@ def build_iv_rank_analysis(
     chain_iv_proxy: Optional[float],
     chain_iv_proxy_meta: Optional[Dict[str, Any]],
     config: StrategyConfig,
+    ctx: Optional[Any] = None,
 ) -> Dict[str, Any]:
     override = symbol_iv_rank_override(symbol, config)
     percentile_override = symbol_iv_percentile_override(symbol, config)
@@ -1511,6 +1318,70 @@ def build_iv_rank_analysis(
             "is_decision_usable_iv_rank": True,
             "priority": "cli_override",
         }
+
+    # OpenD failures are collected while resolving so degraded outcomes can report why.
+    opend_errors: List[str] = []
+
+    if ctx is not None:
+        overview = fetch_underlying_iv_overview(symbol, ctx)
+        overview_iv_rank = safe_float(overview.get("iv_rank"))
+        if overview_iv_rank is not None and math.isfinite(overview_iv_rank):
+            overview_current_iv = safe_float(overview.get("iv"))
+            if overview_current_iv is None:
+                overview_current_iv = current_iv
+            overview_percentile = safe_float(overview.get("iv_percentile"))
+            if overview_percentile is not None and not math.isfinite(overview_percentile):
+                overview_percentile = None
+            return {
+                "iv_rank": round(overview_iv_rank, 2),
+                "iv_percentile": round(overview_percentile, 2) if overview_percentile is not None else None,
+                "current_iv": overview_current_iv,
+                "source": "futu_opend_overview",
+                "method": "Futu OpenD option underlying overview (direct iv_rank / iv_percentile)",
+                "chain_iv_rank_proxy": chain_iv_proxy,
+                "chain_iv_rank_proxy_meta": chain_iv_proxy_meta,
+                "is_true_historical_iv_rank": True,
+                "is_decision_usable_iv_rank": True,
+                "priority": "opend_overview",
+            }
+        opend_errors.append(f"overview: {overview.get('error') or 'iv_rank unavailable'}")
+
+        daily_series = fetch_underlying_daily_iv_series(symbol, ctx)
+        series_values = [
+            value
+            for value in daily_series.get("values") or []
+            if value is not None and math.isfinite(value)
+        ]
+        if len(series_values) >= 20:
+            series_current_iv = series_values[-1]
+            series_iv_rank = calculate_historical_iv_rank(series_current_iv, series_values)
+            if series_iv_rank is not None:
+                return {
+                    "iv_rank": series_iv_rank,
+                    "iv_percentile": calculate_historical_iv_percentile(series_current_iv, series_values),
+                    "current_iv": series_current_iv,
+                    "source": "futu_opend_his_volatility",
+                    "method": "current IV position within Futu OpenD daily IV series (min/max)",
+                    "lookback_count": len(series_values),
+                    "history_status": "OK",
+                    "history_start_date": daily_series.get("start_date"),
+                    "history_end_date": daily_series.get("end_date"),
+                    "chain_iv_rank_proxy": chain_iv_proxy,
+                    "chain_iv_rank_proxy_meta": chain_iv_proxy_meta,
+                    "is_true_historical_iv_rank": True,
+                    "is_decision_usable_iv_rank": True,
+                    "priority": "opend_daily_iv_series",
+                }
+        series_error = daily_series.get("error")
+        if not series_error:
+            series_error = f"insufficient_series_values({len(series_values)})"
+        opend_errors.append(f"his_volatility: {series_error}")
+
+    def with_opend_error(payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Surface OpenD failures on the degraded branches instead of hiding them."""
+        if opend_errors:
+            payload["opend_error"] = "; ".join(opend_errors)
+        return payload
 
     history = load_historical_iv_values(symbol)
     values = history.get("values") or []
@@ -1540,7 +1411,7 @@ def build_iv_rank_analysis(
         memory_percentile = percentile_override
         if memory_percentile is None:
             memory_percentile = safe_float(memory_record.get("iv_percentile"))
-        return {
+        return with_opend_error({
             "iv_rank": round(safe_float(memory_record.get("iv_rank")) or 0.0, 2),
             "iv_percentile": memory_percentile,
             "current_iv": current_iv,
@@ -1557,9 +1428,9 @@ def build_iv_rank_analysis(
             "is_true_historical_iv_rank": False,
             "is_decision_usable_iv_rank": True,
             "priority": "fresh_manual_memory_fallback",
-        }
+        })
 
-    return {
+    return with_opend_error({
         "iv_rank": None,
         "iv_percentile": None,
         "current_iv": current_iv,
@@ -1573,7 +1444,7 @@ def build_iv_rank_analysis(
         "is_true_historical_iv_rank": False,
         "is_decision_usable_iv_rank": False,
         "priority": "unavailable",
-    }
+    })
 
 
 def estimate_underlying_iv(options: pd.DataFrame, stock_price: float, target_dte: int = 30) -> Optional[float]:
@@ -1732,6 +1603,13 @@ def apply_manual_overrides(
 
 def prompt_short_call_manual_metrics(short_call: PositionInput) -> Dict[str, Any]:
     return prompt_short_call_manual_metrics_from_interaction(short_call)
+
+
+def prompt_short_call_metrics_with_auto(
+    short_call_code: str,
+    auto_metrics: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return prompt_short_call_metrics_with_auto_from_interaction(short_call_code, auto_metrics)
 
 
 def build_pmcc_rulebook(config: StrategyConfig) -> Dict[str, Any]:
@@ -2291,6 +2169,129 @@ def build_passarelli_greeks_management(
     }
 
 
+SHORT_CALL_METRIC_FIELDS = ("delta", "profit_capture_pct", "iv")
+
+
+def short_call_close_mark_price(option: Dict[str, Any]) -> Optional[float]:
+    """Price used to value closing a short call: the realizable ask when quoted.
+
+    This intentionally differs from option_mark_price (bid/ask mid) for the
+    profit captured calculation only: a short call is closed by paying the ask.
+    """
+    ask = safe_float(option.get("ask_price"))
+    if ask is not None and ask > 0:
+        return ask
+    return option_mark_price(option)
+
+
+def short_call_profit_capture_pct(
+    cost_price: Optional[float],
+    close_mark: Optional[float],
+) -> Optional[float]:
+    credit = safe_float(cost_price)
+    mark = safe_float(close_mark)
+    if credit is None or credit <= 0 or mark is None:
+        return None
+    return (credit - mark) / credit * 100
+
+
+def short_call_auto_metrics(
+    option_row: Optional[pd.Series],
+    cost_price: Optional[float],
+) -> Dict[str, Optional[float]]:
+    """Metrics that can be derived from an OpenD snapshot row for a short call."""
+    metrics: Dict[str, Optional[float]] = {field: None for field in SHORT_CALL_METRIC_FIELDS}
+    if option_row is None:
+        return metrics
+    option = option_row.to_dict()
+    metrics["delta"] = safe_float(option.get("delta"))
+    metrics["iv"] = safe_float(option.get("implied_volatility"))
+    metrics["profit_capture_pct"] = short_call_profit_capture_pct(cost_price, short_call_close_mark_price(option))
+    return metrics
+
+
+def resolve_short_call_auto_row(
+    short_call: PositionInput,
+    short_snapshot: Optional[pd.DataFrame],
+    metric_options: Optional[pd.DataFrame],
+) -> Optional[pd.Series]:
+    """Find the already fetched OpenD row for an existing short call."""
+    for frame in (short_snapshot, metric_options):
+        if frame is None or getattr(frame, "empty", True):
+            continue
+        row = find_option_row(frame, short_call.raw_code)
+        if row is not None:
+            return row
+    return None
+
+
+def fetch_short_call_greeks(
+    short_calls: List[PositionInput],
+    ctx: Optional[OpenQuoteContext],
+    result: Dict[str, Any],
+) -> pd.DataFrame:
+    """Fetch OpenD snapshot rows for existing short calls without breaking the run.
+
+    A failure here only adds a warning and returns an empty frame so that the
+    call-chain/base enrichment that already succeeded is kept and the run
+    degrades to the manual prompts.
+    """
+    codes = [item.raw_code for item in short_calls]
+    if not codes or ctx is None:
+        return pd.DataFrame()
+    try:
+        return get_greeks(codes, ctx)
+    except Exception as exc:
+        result.setdefault("decision_support", {}).setdefault("warnings", []).append(
+            f"Short call metric fetch failed, falling back to manual input: {enrich_error_message(str(exc))}"
+        )
+        return pd.DataFrame()
+
+
+def classify_short_call_metric_source(
+    auto_metrics: Optional[Dict[str, Any]],
+    manual_metrics: Optional[Dict[str, Any]],
+) -> str:
+    """Classify where a short call's metrics came from: opend_auto/manual/mixed."""
+    auto_fields = {
+        field for field in SHORT_CALL_METRIC_FIELDS if safe_float((auto_metrics or {}).get(field)) is not None
+    }
+    override_fields = set()
+    for field in SHORT_CALL_METRIC_FIELDS:
+        auto_value = safe_float((auto_metrics or {}).get(field))
+        manual_value = safe_float((manual_metrics or {}).get(field))
+        if manual_value is None:
+            continue
+        if auto_value is None or abs(manual_value - auto_value) > 1e-9:
+            override_fields.add(field)
+    if auto_fields and override_fields:
+        return "mixed"
+    if override_fields:
+        return "manual"
+    if auto_fields:
+        return "opend_auto"
+    return "manual"
+
+
+def collect_short_call_metric_inputs(
+    short_calls: List[PositionInput],
+    short_snapshot: Optional[pd.DataFrame],
+    metric_options: Optional[pd.DataFrame],
+) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """Build short-call metric inputs plus per-code provenance from OpenD data."""
+    manual_inputs: Dict[str, Any] = {}
+    sources: Dict[str, str] = {}
+    for item in short_calls:
+        option_row = resolve_short_call_auto_row(item, short_snapshot, metric_options)
+        auto_metrics = short_call_auto_metrics(option_row, item.cost_price)
+        prompted: Optional[Dict[str, Any]] = None
+        if INTERACTIVE_MODE:
+            prompted = prompt_short_call_metrics_with_auto(item.raw_code, auto_metrics)
+            manual_inputs[item.raw_code] = prompted
+        sources[item.raw_code] = classify_short_call_metric_source(auto_metrics, prompted)
+    return manual_inputs, sources
+
+
 def analyze_short_call_position(
     short_call: PositionInput,
     stock_price: float,
@@ -2322,18 +2323,23 @@ def analyze_short_call_position(
         theta = safe_float(option_row.get("theta"))
         iv = safe_float(option_row.get("implied_volatility"))
         mark = option_mark_price(option_row.to_dict())
-        credit = short_call.cost_price
-        if credit is not None and credit > 0 and mark is not None:
-            profit_capture_pct = (credit - mark) / credit * 100
-    elif expiry is not None:
+        profit_capture_pct = short_call_profit_capture_pct(
+            short_call.cost_price,
+            short_call_close_mark_price(option_row.to_dict()),
+        )
+
+    if dte is None and expiry is not None:
         expiry_date = parse_expiry(expiry)
         if expiry_date is not None:
             dte = (expiry_date - pd.Timestamp.today().date()).days
 
     if manual_metrics:
-        delta = safe_float(manual_metrics.get("delta")) if safe_float(manual_metrics.get("delta")) is not None else delta
-        iv = safe_float(manual_metrics.get("iv")) if safe_float(manual_metrics.get("iv")) is not None else iv
-        profit_capture_pct = safe_float(manual_metrics.get("profit_capture_pct"))
+        manual_delta = safe_float(manual_metrics.get("delta"))
+        manual_iv = safe_float(manual_metrics.get("iv"))
+        manual_profit_capture = safe_float(manual_metrics.get("profit_capture_pct"))
+        delta = manual_delta if manual_delta is not None else delta
+        iv = manual_iv if manual_iv is not None else iv
+        profit_capture_pct = manual_profit_capture if manual_profit_capture is not None else profit_capture_pct
 
     abs_delta = abs(delta) if delta is not None else None
     reasons: List[str] = []
@@ -3050,6 +3056,7 @@ def find_roll_candidates_for_short_put(
     stock_price: float,
     config: StrategyConfig,
     limit: int = 5,
+    portfolio_identity: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     if put_options.empty:
         return []
@@ -3121,10 +3128,18 @@ def find_roll_candidates_for_short_put(
         ascending=[False, True, False],
     ).head(limit)
 
-    return [
-        build_put_roll_candidate_record(row, put_review, stock_price, old_buyback_price, safe_float(row.get("roll_score")) or 0.0)
-        for _, row in sorted_candidates.iterrows()
-    ]
+    records = []
+    for _, row in sorted_candidates.iterrows():
+        record = build_put_roll_candidate_record(row, put_review, stock_price, old_buyback_price, safe_float(row.get("roll_score")) or 0.0)
+        record["whole_symbol_roll_pnl"] = estimate_whole_symbol_roll_pnl(
+            put_review,
+            record,
+            {"legs": []},
+            stock_price,
+            portfolio_identity,
+        )
+        records.append(record)
+    return records
 
 
 def load_call_market_data(symbol: str, ctx: OpenQuoteContext, config: StrategyConfig) -> Dict[str, Any]:
@@ -3147,6 +3162,8 @@ def load_call_market_data(symbol: str, ctx: OpenQuoteContext, config: StrategyCo
         if not put_chain.empty:
             put_greeks = get_greeks(put_chain["code"].tolist(), ctx)
             put_enriched = enrich_put_options(put_chain, put_greeks, stock_price)
+            if not put_enriched.empty:
+                build_option_data_quality(symbol, put_enriched)
     except Exception as exc:
         put_error = enrich_error_message(str(exc))
 
@@ -3175,6 +3192,83 @@ def load_call_market_data(symbol: str, ctx: OpenQuoteContext, config: StrategyCo
         "put_error": put_error,
         "iv_snapshot": iv_snapshot,
         "data_quality": data_quality,
+    }
+
+
+
+def load_cboe_market_data(symbol: str) -> Dict[str, Any]:
+    """Fetch stock quote, option chain, Greeks, IV, HV and trend from CBOE + Yahoo.
+
+    Returns the same dict structure as load_call_market_data, so it can be
+    passed directly into decision_engine via call_market_data.
+    """
+    chain, meta = fetch_cboe_data(symbol)
+    stock_price = meta.get("current_price")
+    if stock_price is None:
+        raise RuntimeError(f"CBOE did not return a current_price for {symbol}.")
+    quote_source = "cboe"
+    quote = pd.Series({
+        "last_price": stock_price, "current_price": stock_price,
+        "high": meta.get("high"), "low": meta.get("low"),
+        "open": meta.get("open"), "close": meta.get("close"),
+        "volume": meta.get("volume"),
+    }, name="cboe_quote")
+    calls = chain[chain["option_type"] == "CALL"].copy()
+    puts = chain[chain["option_type"] == "PUT"].copy()
+    greeks = pd.DataFrame({"code": calls["code"].tolist()})
+    enriched = enrich_options(calls, greeks, stock_price)
+    put_greeks = pd.DataFrame({"code": puts["code"].tolist()})
+    put_enriched = enrich_put_options(puts, put_greeks, stock_price) if not puts.empty else pd.DataFrame()
+    data_quality = build_option_data_quality(symbol, enriched)
+    iv_frame = enriched["implied_volatility"] if "implied_volatility" in enriched.columns else pd.Series(dtype=float)
+    valid_iv_rows = int(pd.to_numeric(iv_frame, errors="coerce").gt(0).sum())
+    print(f"[CBOE] {symbol}: chain_rows={len(chain)} enriched_rows={len(enriched)} "
+          f"valid_iv_rows={valid_iv_rows} price={stock_price}")
+    if valid_iv_rows < 8:
+        raise RuntimeError(
+            f"CBOE chain for {symbol} has only {valid_iv_rows} contracts with usable IV "
+            f"(chain rows: {len(chain)}, enriched rows: {len(enriched)}). "
+            f"The download was likely truncated or blocked; check network access to "
+            f"cdn.cboe.com and re-run. (Futu OpenD remains an alternative via --cboe off.)"
+        )
+    iv_snapshot = estimate_pmcc_iv_snapshot(enriched, stock_price, put_enriched)
+    iv_snapshot["method"] = "30D ATM IV sampled from CBOE delayed option chain"
+    try:
+        iv_snapshot["history_record"] = record_pmcc_iv_history(symbol, iv_snapshot)
+    except Exception as exc:
+        iv_snapshot["history_record"] = {"status": "ERROR", "error": str(exc), "path": str(IV_HISTORY_FILE)}
+    hv = None
+    trend = "UNKNOWN"
+    try:
+        ticker = symbol.replace("US.", "")
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=1y&interval=1d"
+        payload = json.loads(http_get_text(url))
+        closes = payload["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+        clean = [c for c in closes if c is not None]
+        if len(clean) >= 8:
+            s = pd.Series(clean)
+            lr = (s / s.shift(1)).dropna().apply(math.log)
+            hv = round(float(lr.std(ddof=1) * (252 ** 0.5) * 100), 2)
+        url2 = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=3mo&interval=1d"
+        p2 = json.loads(http_get_text(url2))
+        c2 = p2["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+        clean2 = pd.Series([c for c in c2 if c is not None])
+        if len(clean2) >= 10:
+            ma_s = clean2.tail(5).mean()
+            ma_m = clean2.tail(min(20, len(clean2))).mean()
+            lat = clean2.iloc[-1]
+            prev = clean2.iloc[-6] if len(clean2) >= 6 else clean2.iloc[0]
+            rr = (lat / prev - 1) if prev else 0.0
+            mg = (ma_s / ma_m - 1) if ma_m else 0.0
+            trend = "UP" if mg > 0.003 and rr > 0.005 else "DOWN" if mg < -0.003 and rr < -0.005 else "FLAT"
+    except Exception:
+        pass
+    return {
+        "quote": quote, "quote_source": quote_source, "stock_price": stock_price,
+        "chain": calls, "greeks": greeks, "enriched": enriched,
+        "put_chain": puts, "put_greeks": put_greeks, "put_enriched": put_enriched,
+        "put_error": None, "iv_snapshot": iv_snapshot, "data_quality": data_quality,
+        "hv": hv, "trend": trend,
     }
 
 
@@ -3225,12 +3319,16 @@ def decision_engine(
     config: StrategyConfig = DEFAULT_CONFIG,
     ctx: Optional[OpenQuoteContext] = None,
     call_market_data: Optional[Dict[str, Any]] = None,
+    use_cboe: bool = False,
 ) -> Dict[str, Any]:
     owns_ctx = ctx is None
     if ctx is None:
-        ctx = OpenQuoteContext(host=HOST, port=PORT)
+        if not use_cboe:
+            ctx = OpenQuoteContext(host=HOST, port=PORT)
     try:
-        if call_market_data is None:
+        if call_market_data is None and use_cboe:
+            call_market_data = load_cboe_market_data(symbol)
+        if call_market_data is None and not use_cboe:
             call_market_data = load_call_market_data(symbol, ctx, config)
         quote_source = call_market_data["quote_source"]
         quote = call_market_data["quote"]
@@ -3250,11 +3348,22 @@ def decision_engine(
             iv_proxy_options = enriched
         chain_iv_rank_proxy_meta = estimate_chain_iv_rank_proxy(iv_proxy_options, stock_price)
         chain_iv_rank_proxy = safe_float(chain_iv_rank_proxy_meta.get("value"))
-        iv_rank_analysis = build_iv_rank_analysis(symbol, underlying_iv, chain_iv_rank_proxy, chain_iv_rank_proxy_meta, config)
+        iv_rank_analysis = build_iv_rank_analysis(
+            symbol,
+            underlying_iv,
+            chain_iv_rank_proxy,
+            chain_iv_rank_proxy_meta,
+            config,
+            ctx=ctx,
+        )
         iv_rank = safe_float(iv_rank_analysis.get("iv_rank"))
         iv_percentile = safe_float(iv_rank_analysis.get("iv_percentile"))
-        hv = estimate_historical_volatility(symbol, ctx)
-        trend = get_trend(symbol, ctx, config.history_bars)
+        hv = call_market_data.get("hv") if call_market_data else None
+        if hv is None and ctx is not None:
+            hv = estimate_historical_volatility(symbol, ctx)
+        trend = call_market_data.get("trend") if call_market_data else None
+        if trend is None and ctx is not None:
+            trend = get_trend(symbol, ctx, config.history_bars)
         enriched, trend, iv_rank, iv_percentile, underlying_iv, hv, manual_inputs = apply_manual_overrides(
             enriched,
             trend,
@@ -3388,6 +3497,7 @@ def analyze_pmcc_symbol(
     short_calls: List[PositionInput],
     config: StrategyConfig,
     portfolio_identity: Optional[Dict[str, Any]] = None,
+    use_cboe: bool = False,
 ) -> Dict[str, Any]:
     short_call_legs = [item for item in short_calls if item.option_type == "CALL"]
     short_put_legs = [item for item in short_calls if item.option_type == "PUT"]
@@ -3430,11 +3540,14 @@ def analyze_pmcc_symbol(
         max_candidate_last_mid_deviation_pct=config.max_candidate_last_mid_deviation_pct,
     )
 
-    shared_ctx = OpenQuoteContext(host=HOST, port=PORT)
+    shared_ctx = None if use_cboe else OpenQuoteContext(host=HOST, port=PORT)
     call_market_data: Optional[Dict[str, Any]] = None
     try:
-        call_market_data = load_call_market_data(symbol, shared_ctx, local_config)
-        result = decision_engine(symbol, local_config, ctx=shared_ctx, call_market_data=call_market_data)
+        if use_cboe:
+            call_market_data = load_cboe_market_data(symbol)
+        else:
+            call_market_data = load_call_market_data(symbol, shared_ctx, local_config)
+        result = decision_engine(symbol, local_config, ctx=shared_ctx, call_market_data=call_market_data, use_cboe=use_cboe)
     except Exception as exc:
         result = {"symbol": symbol, "error": enrich_error_message(str(exc))}
     result["base_positions"] = [
@@ -3497,15 +3610,23 @@ def analyze_pmcc_symbol(
         except Exception as exc:
             enriched = pd.DataFrame()
             put_enriched = pd.DataFrame()
+            base_snapshot = pd.DataFrame()
             metric_options = pd.DataFrame()
             result.setdefault("decision_support", {}).setdefault("warnings", []).append(
                 f"Position metric enrichment failed: {enrich_error_message(str(exc))}"
             )
 
-        short_call_manual_inputs: Dict[str, Any] = {}
-        if INTERACTIVE_MODE:
-            for item in short_calls:
-                short_call_manual_inputs[item.raw_code] = prompt_short_call_manual_metrics(item)
+        short_snapshot = fetch_short_call_greeks(short_call_legs, shared_ctx, result)
+        if not short_snapshot.empty:
+            metric_options = pd.concat([metric_options, short_snapshot], ignore_index=True)
+
+        short_call_manual_inputs: Dict[str, Any]
+        short_call_metric_sources: Dict[str, str]
+        short_call_manual_inputs, short_call_metric_sources = collect_short_call_metric_inputs(
+            short_call_legs,
+            short_snapshot,
+            metric_options,
+        )
 
         long_leg_analysis = estimate_long_leg_metrics(base_positions, result["price"], metric_options)
         if portfolio_identity:
@@ -3569,7 +3690,7 @@ def analyze_pmcc_symbol(
             analyze_short_call_position(
                 item,
                 result["price"],
-                enriched,
+                metric_options,
                 local_config,
                 result.get("iv_rank_est"),
                 base_positions,
@@ -3621,6 +3742,7 @@ def analyze_pmcc_symbol(
                 put_enriched,
                 result["price"],
                 local_config,
+                portfolio_identity=portfolio_identity,
             )
         result["spread_other_reviews"] = [
             {
@@ -3635,6 +3757,8 @@ def analyze_pmcc_symbol(
         ]
         if short_call_manual_inputs:
             result.setdefault("decision_support", {})["short_call_manual_inputs"] = short_call_manual_inputs
+        if short_call_metric_sources:
+            result.setdefault("decision_support", {})["short_call_metric_sources"] = short_call_metric_sources
         short_vega = 0.0
         for item in result["short_call_reviews"]:
             item_vega = safe_float(item.get("vega"))
@@ -3826,6 +3950,7 @@ def build_pmcc_two_stage_result(
     memory_save_short_calls: Optional[List[PositionInput]] = None,
     memory_scope: str = "analysis_snapshot",
     save_memory: bool = True,
+    use_cboe: bool = False,
 ) -> Dict[str, Any]:
     print_position_inventory_before_analysis(base_positions, short_calls)
     if save_memory:
@@ -3855,13 +3980,17 @@ def build_pmcc_two_stage_result(
             "portfolio_label": portfolio_label,
             "symbol": symbol,
         }
-        result = analyze_pmcc_symbol(
-            symbol,
-            grouped_bases.get(symbol, []),
-            grouped_shorts.get(symbol, []),
-            config,
-            portfolio_identity,
-        )
+        try:
+            result = analyze_pmcc_symbol(
+                symbol,
+                grouped_bases.get(symbol, []),
+                grouped_shorts.get(symbol, []),
+                config,
+                portfolio_identity,
+                use_cboe=use_cboe,
+            )
+        except Exception as exc:
+            result = {"symbol": symbol, "error": enrich_error_message(str(exc)), "portfolio_id": portfolio_id, "portfolio_label": portfolio_label}
         position_analysis, operation_recommendation = split_pmcc_result(result)
         if portfolio_id is not None:
             position_analysis["portfolio_id"] = portfolio_id
@@ -3891,6 +4020,7 @@ def build_pmcc_multi_portfolio_result(
     source_metadata: Dict[str, Any],
     portfolios: List[Dict[str, Any]],
     config: StrategyConfig,
+    use_cboe: bool = False,
 ) -> Dict[str, Any]:
     stage_1: List[Dict[str, Any]] = []
     stage_2: List[Dict[str, Any]] = []
@@ -3911,6 +4041,7 @@ def build_pmcc_multi_portfolio_result(
             portfolio_short_calls,
             config,
             save_memory=False,
+            use_cboe=use_cboe,
         )
         stage_1.extend(child["stage_1_position_analysis"])
         stage_2.extend(child["stage_2_operation_recommendations"])
@@ -3954,9 +4085,213 @@ def build_pmcc_multi_portfolio_result(
     }
 
 
-def run_pmcc_interactive(config: StrategyConfig) -> Dict[str, Any]:
+def run_pmcc_interactive(config: StrategyConfig, use_cboe: bool = False) -> Dict[str, Any]:
     base_positions, short_calls, metadata = collect_positions_interactive()
-    return build_pmcc_two_stage_result(metadata, base_positions, short_calls, config)
+    return build_pmcc_two_stage_result(metadata, base_positions, short_calls, config, use_cboe=use_cboe)
+
+
+def run_pmcc_csv(config: StrategyConfig, csv_dir: Path) -> Dict[str, Any]:
+    """PMCC workflow without Futu OpenD: positions come from the latest CSV exports.
+
+    - Scans *csv_dir* for the newest Schwab / Futu position CSVs.
+    - A CSV newer than the last run replaces the saved JSON snapshot for that
+      broker; otherwise the previously recorded positions are reused untouched.
+    - Market data always comes from CBOE delayed quotes (no OpenD connection).
+    """
+    csv_dir = Path(csv_dir)
+    use_cboe = True
+    latest = find_latest_position_csvs(csv_dir) if csv_dir.is_dir() else {"schwab": None, "futu": None}
+    if not csv_dir.is_dir():
+        print(f"WARNING: csv-dir not found: {csv_dir}; using saved positions.")
+    state = load_csv_state(CSV_STATE_FILE)
+    state_files = dict(state.get("files") or {})
+
+    futu_base_positions, futu_short_calls, futu_metadata = load_broker_positions(FUTU_POSITIONS_FILE)
+    schwab_base_positions, schwab_short_calls, schwab_metadata = load_broker_positions(SCHWAB_POSITIONS_FILE)
+
+    def _refresh_from_csv(
+        broker: str,
+        positions_file: Path,
+        csv_path: Optional[Path],
+        parse_fn,
+    ) -> Tuple[List[PositionInput], List[PositionInput], Dict[str, Any]]:
+        base_positions, short_calls, metadata = load_broker_positions(positions_file)
+        record = state_files.get(broker)
+        if csv_path is None:
+            print(f"[CSV] {broker}: no CSV found in {csv_dir}; reusing saved positions "
+                  f"({metadata.get('base_contracts', 0)} base / {metadata.get('short_contracts', 0)} short).")
+            return base_positions, short_calls, {**metadata, "csv_mode": "reuse_saved_no_csv_found"}
+        if not is_new_csv(csv_path, record):
+            print(f"[CSV] {broker}: {csv_path.name} already consumed; reusing saved positions "
+                  f"({metadata.get('base_contracts', 0)} base / {metadata.get('short_contracts', 0)} short).")
+            return base_positions, short_calls, {**metadata, "csv_mode": "reuse_saved_csv_unchanged"}
+        try:
+            parsed_base, parsed_shorts, parse_meta = parse_fn(csv_path)
+        except Exception as exc:
+            print(f"[CSV] WARNING: failed to parse {csv_path.name}: {exc}; reusing saved positions.")
+            return base_positions, short_calls, {**metadata, "csv_mode": "reuse_saved_parse_failed"}
+        if not parse_meta.get("rows_seen"):
+            print(f"[CSV] WARNING: {csv_path.name} has no data rows; reusing saved positions.")
+            return base_positions, short_calls, {**metadata, "csv_mode": "reuse_saved_csv_empty"}
+        save_broker_positions(positions_file, f"{broker}_csv_positions", parsed_base, parsed_shorts)
+        state_files[broker] = {"name": csv_path.name, "mtime": csv_path.stat().st_mtime}
+        print(f"[CSV] {broker}: loaded {csv_path.name} -> "
+              f"{parse_meta.get('base_contracts', 0)} base / {parse_meta.get('short_contracts', 0)} short "
+              f"({len(parse_meta.get('skipped') or [])} rows skipped).")
+        return parsed_base, parsed_shorts, {
+            **parse_meta,
+            "csv_mode": "loaded_from_csv",
+            "csv_file": csv_path.name,
+        }
+
+    futu_base_positions, futu_short_calls, futu_csv_meta = _refresh_from_csv(
+        "futu", FUTU_POSITIONS_FILE, latest.get("futu"), parse_futu_position_csv
+    )
+    schwab_base_positions, schwab_short_calls, schwab_csv_meta = _refresh_from_csv(
+        "schwab", SCHWAB_POSITIONS_FILE, latest.get("schwab"), parse_schwab_position_statement
+    )
+    save_csv_state(CSV_STATE_FILE, state_files)
+
+    print_broker_position_confirmation("Futu (CSV)", futu_base_positions, futu_short_calls, futu_csv_meta)
+    print_broker_position_confirmation("Schwab (CSV)", schwab_base_positions, schwab_short_calls, schwab_csv_meta)
+
+    metadata = {
+        "source": "csv_positions_no_opend",
+        "analysis_policy": "broker_account_isolated",
+        "csv_dir": str(csv_dir),
+        "futu": futu_csv_meta,
+        "schwab": schwab_csv_meta,
+        "total_base_contracts": sum(item.quantity for item in futu_base_positions) + sum(item.quantity for item in schwab_base_positions),
+        "total_short_contracts": sum(item.quantity for item in futu_short_calls) + sum(item.quantity for item in schwab_short_calls),
+    }
+    return build_pmcc_multi_portfolio_result(
+        metadata,
+        [
+            {
+                "portfolio_id": "FUTU",
+                "portfolio_label": "Futu (CSV)",
+                "source": futu_csv_meta.get("source") or "futu_csv_positions",
+                "base_positions": futu_base_positions,
+                "short_calls": futu_short_calls,
+            },
+            {
+                "portfolio_id": "SCHWAB",
+                "portfolio_label": "Schwab (CSV)",
+                "source": schwab_csv_meta.get("source") or "schwab_csv_positions",
+                "base_positions": schwab_base_positions,
+                "short_calls": schwab_short_calls,
+            },
+        ],
+        config,
+        use_cboe=use_cboe,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Schwab Position Statement auto-discovery for opend mode
+# ---------------------------------------------------------------------------
+
+# Separate from the csv-mode "schwab" key so opend runs do not consume csv-mode state.
+SCHWAB_OPEND_CSV_STATE_KEY = "schwab_opend"
+
+
+def auto_schwab_csv_sort_key(path: Path) -> Tuple[str, float]:
+    """Order auto-discovered CSVs like find_latest_position_csvs: name date, then mtime."""
+    path = Path(path)
+    match = SCHWAB_FILENAME_DATE_RE.search(path.name)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return (match.group(1) if match else "", mtime)
+
+
+def find_auto_schwab_position_csv(directories: Sequence[Path]) -> Optional[Path]:
+    """Newest Schwab Position Statement CSV across the given directories."""
+    candidates: List[Path] = []
+    for directory in directories:
+        candidate = find_latest_position_csvs(Path(directory)).get("schwab")
+        if candidate is not None:
+            candidates.append(candidate)
+    if not candidates:
+        return None
+    return max(candidates, key=auto_schwab_csv_sort_key)
+
+
+def _schwab_auto_decision(mode: str, csv_path: Optional[Path] = None, **extra: Any) -> Dict[str, Any]:
+    decision: Dict[str, Any] = {
+        "mode": mode,
+        "csv_path": csv_path,
+        "base_positions": [],
+        "short_calls": [],
+        "metadata": {},
+        "state_record": None,
+        "error": "",
+    }
+    decision.update(extra)
+    return decision
+
+
+def resolve_auto_schwab_import(
+    explicit_path: str = "",
+    directories: Optional[Sequence[Path]] = None,
+    state_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Decide how run_pmcc_opend should obtain the Schwab positions.
+
+    Modes:
+    - ``explicit``: --schwab-import-positions wins; caller keeps its old branch.
+    - ``auto_import``: a not-yet-consumed CSV was found and parsed successfully.
+    - ``already_consumed``: newest CSV matches the saved ``schwab_opend`` record.
+    - ``parse_failed``: newest CSV exists but is unusable; retried on the next run.
+    - ``none``: no Schwab CSV in any scanned directory.
+
+    Parsing happens here inside try/except so a bad CSV can never abort a run and
+    never advances the ``schwab_opend`` state record.
+    """
+    if explicit_path.strip():
+        return _schwab_auto_decision("explicit", Path(explicit_path.strip()))
+    program_dir = Path(__file__).resolve().parent
+    search_dirs = [Path(item) for item in directories] if directories is not None else [program_dir, program_dir.parent]
+    state_file = Path(state_path) if state_path is not None else CSV_STATE_FILE
+    csv_path = find_auto_schwab_position_csv(search_dirs)
+    if csv_path is None:
+        return _schwab_auto_decision("none")
+    saved_record = (load_csv_state(state_file).get("files") or {}).get(SCHWAB_OPEND_CSV_STATE_KEY)
+    if not is_new_csv(csv_path, saved_record):
+        return _schwab_auto_decision("already_consumed", csv_path)
+    try:
+        base_positions, short_calls, metadata = parse_schwab_position_statement(csv_path)
+    except Exception as exc:  # noqa: BLE001 - a broken export must never break the run
+        return _schwab_auto_decision("parse_failed", csv_path, error=str(exc))
+    if not metadata.get("rows_seen"):
+        return _schwab_auto_decision("parse_failed", csv_path, error="no data rows")
+    try:
+        mtime = csv_path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return _schwab_auto_decision(
+        "auto_import",
+        csv_path,
+        base_positions=base_positions,
+        short_calls=short_calls,
+        metadata=metadata,
+        state_record={"name": csv_path.name, "mtime": mtime},
+    )
+
+
+def remember_schwab_opend_csv(state_record: Optional[Dict[str, Any]], state_path: Optional[Path] = None) -> None:
+    """Persist the consumed auto-imported CSV under the ``schwab_opend`` state key."""
+    if not state_record:
+        return
+    state_file = Path(state_path) if state_path is not None else CSV_STATE_FILE
+    state = load_csv_state(state_file)
+    state_files = dict(state.get("files") or {})
+    state_files[SCHWAB_OPEND_CSV_STATE_KEY] = {
+        "name": state_record.get("name"),
+        "mtime": state_record.get("mtime"),
+    }
+    save_csv_state(state_file, state_files)
 
 
 def run_pmcc_opend(
@@ -3967,17 +4302,31 @@ def run_pmcc_opend(
     schwab_remove_short_raw: str = "",
     schwab_import_positions_path: str = "",
     prompt_external: bool = True,
+    use_cboe: bool = False,
+    auto_schwab_dirs: Optional[Sequence[Path]] = None,
 ) -> Dict[str, Any]:
     previous_futu_base_positions, previous_futu_short_calls, previous_futu_metadata = load_broker_positions(FUTU_POSITIONS_FILE)
     schwab_base_positions, schwab_short_calls, schwab_metadata = load_broker_positions(SCHWAB_POSITIONS_FILE)
-    opend_base_positions, opend_short_calls, opend_metadata = collect_positions_from_opend()
+    if use_cboe:
+        opend_base_positions, opend_short_calls, opend_metadata = [], [], {"source": "cboe_skipped", "base_contracts": 0, "short_call_contracts": 0}
+        print("[CBOE mode] Skipped Futu OpenD position collection; using saved JSON positions.")
+    else:
+        opend_base_positions, opend_short_calls, opend_metadata = collect_positions_from_opend()
     futu_position_diff = {
         "base_positions": diff_positions_by_code(previous_futu_base_positions, opend_base_positions),
         "short_positions": diff_positions_by_code(previous_futu_short_calls, opend_short_calls),
     }
     save_broker_positions(FUTU_POSITIONS_FILE, "futu_opend_snapshot", opend_base_positions, opend_short_calls)
 
-    if schwab_import_positions_path.strip():
+    if auto_schwab_dirs is None:
+        program_dir = Path(__file__).resolve().parent
+        auto_schwab_dirs = [program_dir, program_dir.parent]
+    auto_schwab_import = resolve_auto_schwab_import(
+        explicit_path=schwab_import_positions_path,
+        directories=auto_schwab_dirs,
+        state_path=CSV_STATE_FILE,
+    )
+    if auto_schwab_import["mode"] == "explicit":
         schwab_base_positions, schwab_short_calls, schwab_change_metadata = parse_tos_position_statement(
             Path(schwab_import_positions_path)
         )
@@ -3985,7 +4334,28 @@ def run_pmcc_opend(
             **schwab_change_metadata,
             "mode": "replace_from_thinkorswim_position_statement",
         }
+    elif auto_schwab_import["mode"] == "auto_import":
+        schwab_base_positions = auto_schwab_import["base_positions"]
+        schwab_short_calls = auto_schwab_import["short_calls"]
+        schwab_change_metadata = {
+            **auto_schwab_import["metadata"],
+            "mode": "replace_from_auto_schwab_position_statement",
+            "csv_mode": "auto_imported",
+            "csv_file": auto_schwab_import["csv_path"].name,
+        }
+        print(
+            f"[Schwab CSV] auto-imported {auto_schwab_import['csv_path'].name} -> "
+            f"{auto_schwab_import['metadata'].get('base_contracts', 0)} base / "
+            f"{auto_schwab_import['metadata'].get('short_contracts', 0)} short."
+        )
     else:
+        if auto_schwab_import["mode"] == "already_consumed":
+            print(f"[Schwab CSV] {auto_schwab_import['csv_path'].name} already imported; reusing saved Schwab positions.")
+        elif auto_schwab_import["mode"] == "parse_failed":
+            print(
+                f"[Schwab CSV] WARNING: failed to parse {auto_schwab_import['csv_path'].name}: "
+                f"{auto_schwab_import.get('error') or 'unknown error'}; reusing saved Schwab positions."
+            )
         if external_base_raw.strip() or external_short_raw.strip() or not prompt_external:
             external_base_positions, external_short_calls, external_metadata = collect_external_positions_from_args(
                 external_base_raw,
@@ -4014,7 +4384,15 @@ def run_pmcc_opend(
             "base_contracts": 0,
             "short_call_contracts": 0,
         }
+    elif auto_schwab_import["mode"] == "auto_import":
+        external_metadata = {
+            "source": "skipped_for_auto_schwab_import",
+            "base_contracts": 0,
+            "short_call_contracts": 0,
+        }
     save_broker_positions(SCHWAB_POSITIONS_FILE, "schwab_manual_positions", schwab_base_positions, schwab_short_calls)
+    if auto_schwab_import["mode"] == "auto_import":
+        remember_schwab_opend_csv(auto_schwab_import.get("state_record"), CSV_STATE_FILE)
     print_broker_position_confirmation(
         "Schwab",
         schwab_base_positions,
@@ -4048,6 +4426,10 @@ def run_pmcc_opend(
         "futu_position_diff": futu_position_diff,
         "schwab": schwab_metadata,
         "schwab_changes": schwab_change_metadata,
+        "schwab_auto_import": {
+            "mode": auto_schwab_import["mode"],
+            "csv_file": auto_schwab_import["csv_path"].name if auto_schwab_import["csv_path"] is not None else "",
+        },
         "opend": opend_metadata,
         "external": {**external_metadata, "meaning": "schwab_additions"},
         "merge": {
@@ -4065,7 +4447,7 @@ def run_pmcc_opend(
         [
             {
                 "portfolio_id": "FUTU",
-                "portfolio_label": "Futu OpenD",
+                "portfolio_label": "Futu OpenD" if not use_cboe else "Futu (CBOE data)",
                 "source": "futu_opend",
                 "base_positions": opend_base_positions,
                 "short_calls": opend_short_calls,
@@ -4079,6 +4461,7 @@ def run_pmcc_opend(
             },
         ],
         config,
+        use_cboe=use_cboe,
     )
 
 
@@ -4117,6 +4500,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trade-journal-path", default=str(TRADE_JOURNAL_FILE), help="Local append-only trade journal JSONL path; defaults outside Git under PMCC_DATA_DIR or ~/.pmcc")
     parser.add_argument("--no-external-prompt", action="store_true", help="Skip prompting for additional non-Futu positions")
     parser.add_argument("--no-web-validation", action="store_true", help="Disable Yahoo Finance and NextEarningsDate backup validation")
+    parser.add_argument("--cboe", action="store_true", help="Use free CBOE delayed quotes for option chain/Greeks instead of Futu OpenD; no account needed, ~15 min delayed. Uses Yahoo for HV/trend.")
+    parser.add_argument("--csv-positions", action="store_true", help="No OpenD: use the latest Schwab/Futu position CSVs from --csv-dir as positions. Falls back to saved positions when no new CSV. Market data via CBOE.")
+    parser.add_argument("--csv-dir", default=".", help="Directory scanned for the latest Schwab/Futu position CSV exports (default: current directory)")
     args = parser.parse_args()
     global_iv_rank, args.iv_rank_overrides_map = parse_iv_override_input(args.iv_rank_overrides, "IV Rank")
     global_iv_percentile, args.iv_percentile_overrides_map = parse_iv_override_input(args.iv_percentile_overrides, "IV Percentile")
@@ -4172,7 +4558,12 @@ def main() -> None:
         enable_web_validation=not args.no_web_validation,
     )
 
-    if args.pmcc_opend:
+    if args.csv_positions:
+        print("")
+        print("CSV 持仓模式：不连接 Futu OpenD，以最新 CSV 为持仓依据，行情走 CBOE 延迟数据。")
+        print("")
+        result = run_pmcc_csv(config, Path(args.csv_dir))
+    elif args.pmcc_opend:
         print("")
         print("重要提醒：请先启动 Futu OpenD，完成登录，并保持 OpenD 正在运行。")
         print(f"程序将通过 {HOST}:{PORT} 连接 Futu OpenD 读取持仓和行情；如果 OpenD 未启动，后续会连接失败。")
@@ -4194,11 +4585,12 @@ def main() -> None:
             schwab_remove_short_raw=args.schwab_remove_short,
             schwab_import_positions_path=args.schwab_import_positions,
             prompt_external=False,
+            use_cboe=args.cboe,
         )
     elif args.pmcc_interactive:
-        result = run_pmcc_interactive(config)
+        result = run_pmcc_interactive(config, use_cboe=args.cboe)
     else:
-        result = decision_engine(args.symbol, config)
+        result = decision_engine(args.symbol, config, use_cboe=args.cboe)
 
     report_path = write_html_report(result)
     print(format_plain_text_report(result))

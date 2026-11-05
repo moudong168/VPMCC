@@ -1650,6 +1650,231 @@ class StrategyCoreTests(unittest.TestCase):
         self.assertEqual(result["roll_action"], "HOLD_DECAY")
         self.assertIn("Short call is still comfortably OTM", result["reason"])
 
+    def test_short_call_review_uses_opend_greeks_row_and_ask_mark(self) -> None:
+        short_call = pmcc.PositionInput(
+            raw_code="US.NVDA260618C240000",
+            underlying="US.NVDA",
+            quantity=1,
+            strike=240.0,
+            expiry="2026-06-18",
+            option_type="CALL",
+            cost_price=3.74,
+        )
+        greeks_row = pd.DataFrame(
+            [
+                {
+                    "code": "US.NVDA260618C240000",
+                    "delta": 0.31,
+                    "gamma": 0.012,
+                    "vega": 0.21,
+                    "theta": -0.09,
+                    "rho": 0.02,
+                    "implied_volatility": 62.66,
+                    "premium": 1.9,
+                    "open_interest": 640,
+                    "bid_price": 1.80,
+                    "ask_price": 2.00,
+                    "last_price": 1.90,
+                    "volume": 120,
+                }
+            ]
+        )
+
+        result = pmcc.analyze_short_call_position(
+            short_call,
+            stock_price=215.0,
+            options=greeks_row,
+            config=pmcc.DEFAULT_CONFIG,
+            iv_rank=None,
+            base_positions=[],
+        )
+
+        self.assertEqual(result["delta"], 0.31)
+        self.assertEqual(result["iv"], 62.66)
+        self.assertAlmostEqual(result["profit_capture_pct"], round((3.74 - 2.00) / 3.74 * 100, 1), places=6)
+        self.assertAlmostEqual(result["mark_price"], 1.90, places=6)
+        self.assertIsNotNone(result["days_to_expiry"])
+
+    def test_short_call_manual_profit_capture_only_overrides_when_present(self) -> None:
+        short_call = pmcc.PositionInput(
+            raw_code="US.NVDA260618C240000",
+            underlying="US.NVDA",
+            quantity=1,
+            strike=240.0,
+            expiry="2026-06-18",
+            option_type="CALL",
+            cost_price=3.74,
+        )
+        greeks_row = pd.DataFrame(
+            [
+                {
+                    "code": "US.NVDA260618C240000",
+                    "delta": 0.31,
+                    "gamma": 0.012,
+                    "vega": 0.21,
+                    "theta": -0.09,
+                    "implied_volatility": 62.66,
+                    "bid_price": 1.80,
+                    "ask_price": 2.00,
+                    "last_price": 1.90,
+                }
+            ]
+        )
+        computed_profit_capture = round((3.74 - 2.00) / 3.74 * 100, 1)
+
+        no_manual = pmcc.analyze_short_call_position(
+            short_call,
+            stock_price=215.0,
+            options=greeks_row,
+            config=pmcc.DEFAULT_CONFIG,
+            iv_rank=None,
+            base_positions=[],
+            manual_metrics={"delta": None, "iv": None, "profit_capture_pct": None},
+        )
+
+        self.assertAlmostEqual(no_manual["profit_capture_pct"], computed_profit_capture, places=6)
+        self.assertEqual(no_manual["delta"], 0.31)
+        self.assertEqual(no_manual["iv"], 62.66)
+
+        overridden = pmcc.analyze_short_call_position(
+            short_call,
+            stock_price=215.0,
+            options=greeks_row,
+            config=pmcc.DEFAULT_CONFIG,
+            iv_rank=None,
+            base_positions=[],
+            manual_metrics={"delta": 0.44, "iv": 55.5, "profit_capture_pct": 80.0},
+        )
+
+        self.assertEqual(overridden["profit_capture_pct"], 80.0)
+        self.assertEqual(overridden["delta"], 0.44)
+        self.assertEqual(overridden["iv"], 55.5)
+
+    def test_short_call_metrics_resolve_as_opend_auto_from_quote_context(self) -> None:
+        class FakeQuoteContext:
+            def __init__(self, snapshot: pd.DataFrame) -> None:
+                self.snapshot = snapshot
+
+            def get_market_snapshot(self, codes):
+                wanted = list(codes)
+                rows = self.snapshot[self.snapshot["code"].isin(wanted)]
+                return 0, rows.reset_index(drop=True)
+
+        short_call = pmcc.PositionInput(
+            raw_code="US.NVDA260618C240000",
+            underlying="US.NVDA",
+            quantity=1,
+            strike=240.0,
+            expiry="2026-06-18",
+            option_type="CALL",
+            cost_price=3.74,
+        )
+        snapshot = pd.DataFrame(
+            [
+                {
+                    "code": "US.NVDA260618C240000",
+                    "option_delta": 0.31,
+                    "option_gamma": 0.012,
+                    "option_vega": 0.21,
+                    "option_theta": -0.09,
+                    "option_rho": 0.02,
+                    "option_implied_volatility": 62.66,
+                    "option_premium": 1.9,
+                    "option_open_interest": 640,
+                    "bid_price": 1.80,
+                    "ask_price": 2.00,
+                    "last_price": 1.90,
+                    "volume": 120,
+                }
+            ]
+        )
+        result = {"decision_support": {}}
+        with patch("builtins.print"):
+            short_snapshot = pmcc.fetch_short_call_greeks([short_call], FakeQuoteContext(snapshot), result)
+
+        self.assertFalse(short_snapshot.empty)
+        self.assertEqual(short_snapshot["implied_volatility"].iloc[0], 62.66)
+        self.assertNotIn("warnings", result["decision_support"])
+
+        prompts = []
+
+        def fake_input(prompt: str = "") -> str:
+            prompts.append(prompt)
+            return ""
+
+        with patch("builtins.input", side_effect=fake_input), patch("builtins.print"), patch.object(
+            pmcc_interaction,
+            "prompt_optional_float",
+            side_effect=AssertionError("free-form prompt must not be used for fetched fields"),
+        ), patch.object(pmcc, "INTERACTIVE_MODE", True):
+            manual_inputs, sources = pmcc.collect_short_call_metric_inputs([short_call], short_snapshot, pd.DataFrame())
+
+        self.assertEqual(sources["US.NVDA260618C240000"], "opend_auto")
+        self.assertAlmostEqual(manual_inputs["US.NVDA260618C240000"]["delta"], 0.31)
+        self.assertAlmostEqual(manual_inputs["US.NVDA260618C240000"]["iv"], 62.66)
+        self.assertAlmostEqual(
+            manual_inputs["US.NVDA260618C240000"]["profit_capture_pct"],
+            (3.74 - 2.00) / 3.74 * 100,
+            places=6,
+        )
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("current 0.31", prompts[0])
+        self.assertIn("current 62.66", prompts[1])
+
+    def test_short_call_metric_fetch_failure_warns_and_keeps_manual_prompts(self) -> None:
+        class OfflineQuoteContext:
+            def get_market_snapshot(self, codes):
+                raise RuntimeError("OpenD offline")
+
+        short_call = pmcc.PositionInput(
+            raw_code="US.NVDA260618C240000",
+            underlying="US.NVDA",
+            quantity=1,
+            strike=240.0,
+            expiry="2026-06-18",
+            option_type="CALL",
+            cost_price=3.74,
+        )
+        result = {"decision_support": {}}
+        with patch("builtins.print"):
+            short_snapshot = pmcc.fetch_short_call_greeks([short_call], OfflineQuoteContext(), result)
+
+        self.assertTrue(short_snapshot.empty)
+        self.assertIn("Short call metric fetch failed", result["decision_support"]["warnings"][0])
+
+        cboe_result = {"decision_support": {}}
+        with patch("builtins.print"):
+            cboe_snapshot = pmcc.fetch_short_call_greeks([short_call], None, cboe_result)
+        self.assertTrue(cboe_snapshot.empty)
+        self.assertNotIn("warnings", cboe_result["decision_support"])
+
+        with patch("builtins.input", side_effect=["0.29", "55", "43.7"]), patch("builtins.print"), patch.object(
+            pmcc, "INTERACTIVE_MODE", True
+        ):
+            manual_inputs, sources = pmcc.collect_short_call_metric_inputs([short_call], short_snapshot, pd.DataFrame())
+
+        self.assertEqual(sources["US.NVDA260618C240000"], "manual")
+        self.assertEqual(manual_inputs["US.NVDA260618C240000"]["delta"], 0.29)
+        self.assertEqual(manual_inputs["US.NVDA260618C240000"]["profit_capture_pct"], 55.0)
+        self.assertEqual(manual_inputs["US.NVDA260618C240000"]["iv"], 43.7)
+
+    def test_short_call_metric_source_is_mixed_when_user_overrides_fetched_value(self) -> None:
+        auto_metrics = {"delta": 0.31, "profit_capture_pct": 46.5, "iv": 62.66}
+
+        self.assertEqual(pmcc.classify_short_call_metric_source(auto_metrics, None), "opend_auto")
+        self.assertEqual(
+            pmcc.classify_short_call_metric_source(auto_metrics, {"delta": 0.31, "iv": 62.66}),
+            "opend_auto",
+        )
+        self.assertEqual(
+            pmcc.classify_short_call_metric_source(auto_metrics, {"delta": 0.42, "iv": 62.66}),
+            "mixed",
+        )
+        self.assertEqual(
+            pmcc.classify_short_call_metric_source({"delta": None, "iv": None, "profit_capture_pct": None}, {"delta": 0.29}),
+            "manual",
+        )
+
     def test_decision_engine_preserves_top_level_json_keys(self) -> None:
         enriched = pd.DataFrame(
             [
