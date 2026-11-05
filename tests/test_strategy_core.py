@@ -1301,7 +1301,7 @@ class StrategyCoreTests(unittest.TestCase):
             path = Path(handle.name)
 
         try:
-            bases, shorts, metadata = pmcc.parse_tos_position_statement(Path(f" {path} "))
+            bases, shorts, stocks, metadata = pmcc.parse_tos_position_statement(Path(f" {path} "))
         finally:
             path.unlink(missing_ok=True)
 

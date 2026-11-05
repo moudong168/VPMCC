@@ -82,6 +82,16 @@ def position_from_record(record: Dict[str, Any]) -> Optional[PositionInput]:
         return None
 
     code = normalize_option_code(code)
+    if safe_text(record.get("option_type")) == "STOCK":
+        return PositionInput(
+            raw_code=code,
+            underlying=safe_text(record.get("underlying")) or code,
+            quantity=quantity,
+            strike=None,
+            expiry=None,
+            option_type="STOCK",
+            cost_price=safe_float(record.get("cost_price")),
+        )
     meta = parse_option_code_metadata(code)
     return PositionInput(
         raw_code=code,

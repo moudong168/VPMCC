@@ -12,6 +12,7 @@ plus no-CSV behaviour and the run_pmcc_opend state advance.
 
 import contextlib
 import io
+import json
 import sys
 import tempfile
 import types
@@ -26,6 +27,8 @@ MSFT,,,,,,"$41,567.50"
 100 17 JUN 27 480 CALL,-3,261,66.98,73.00,-3.669,"($21,900.00)"
 100 17 JUN 27 330 CALL,+1,261,102.00,187.35,-5.2962,"$18,735.00"
 """
+
+SCHWAB_SAMPLE_WITH_STOCK = SCHWAB_SAMPLE.replace('MSFT,,,,,,"$41,567.50"', 'AAPL,+200,3,180.00,181.50,+1.5,"$36,300.00"')
 
 CORRUPT_BYTES = b"\xff\xfe\x00\x00 not a utf-8 position statement \x80\x81"
 
@@ -145,6 +148,74 @@ class SchwabAutoImportDiscoveryTests(unittest.TestCase):
         self.assertEqual(decision["mode"], "parse_failed")
         self.assertEqual(decision["error"], "no data rows")
 
+    def _consumed_setup(self, root: Path, content: str = SCHWAB_SAMPLE_WITH_STOCK) -> Path:
+        """Write a CSV and mark it consumed via a first auto-import."""
+        program_dir = root / "program"
+        program_dir.mkdir()
+        csv_path = self._write_csv(root, "2026-09-29-PositionStatement.csv", content=content)
+        state_path = root / "pmcc_csv_state.json"
+        first = pmcc.resolve_auto_schwab_import(
+            directories=[program_dir, root],
+            state_path=state_path,
+            snapshot_path=root / "missing_snapshot.json",
+        )
+        assert first["mode"] == "auto_import"
+        pmcc.remember_schwab_opend_csv(first["state_record"], state_path)
+        return csv_path
+
+    def test_legacy_snapshot_missing_stock_key_forces_reimport(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = self._consumed_setup(root)
+            state_path = root / "pmcc_csv_state.json"
+            snapshot_path = root / "pmcc_schwab_positions.json"
+            snapshot_path.write_text(
+                json.dumps({"source": "schwab_snapshot", "base_position_records": []}),
+                encoding="utf-8",
+            )
+            decision = pmcc.resolve_auto_schwab_import(
+                directories=[root / "program", root],
+                state_path=state_path,
+                snapshot_path=snapshot_path,
+            )
+        self.assertEqual(decision["mode"], "auto_import")
+        self.assertEqual(decision["csv_path"], csv_path)
+        self.assertEqual(sum(p.quantity for p in decision["stock_positions"]), 200)
+        self.assertEqual(decision["state_record"]["name"], csv_path.name)
+
+    def test_snapshot_with_stock_key_keeps_already_consumed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = self._consumed_setup(root)
+            state_path = root / "pmcc_csv_state.json"
+            snapshot_path = root / "pmcc_schwab_positions.json"
+            snapshot_path.write_text(
+                json.dumps({"source": "schwab_snapshot", "stock_position_records": []}),
+                encoding="utf-8",
+            )
+            decision = pmcc.resolve_auto_schwab_import(
+                directories=[root / "program", root],
+                state_path=state_path,
+                snapshot_path=snapshot_path,
+            )
+        self.assertEqual(decision["mode"], "already_consumed")
+        self.assertEqual(decision["csv_path"], csv_path)
+        self.assertIsNone(decision["state_record"])
+
+    def test_missing_snapshot_keeps_already_consumed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = self._consumed_setup(root)
+            state_path = root / "pmcc_csv_state.json"
+            decision = pmcc.resolve_auto_schwab_import(
+                directories=[root / "program", root],
+                state_path=state_path,
+                snapshot_path=root / "no_such_snapshot.json",
+            )
+        self.assertEqual(decision["mode"], "already_consumed")
+        self.assertEqual(decision["csv_path"], csv_path)
+        self.assertIsNone(decision["state_record"])
+
     def test_newest_csv_across_program_and_parent_directory_wins(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -194,7 +265,7 @@ class RunPmccOpendAutoImportTests(unittest.TestCase):
             state_path = root / "pmcc_csv_state.json"
             positions_file = root / "pmcc_schwab_positions.json"
             stdout = io.StringIO()
-            with patch.object(pmcc, "load_broker_positions", return_value=([], [], {"source": "stub"})), patch.object(
+            with patch.object(pmcc, "load_broker_positions", return_value=([], [], [], {"source": "stub"})), patch.object(
                 pmcc, "save_broker_positions"
             ) as save_positions_mock, patch.object(
                 pmcc, "print_broker_position_confirmation"
@@ -232,7 +303,7 @@ class RunPmccOpendAutoImportTests(unittest.TestCase):
             csv_path.write_bytes(CORRUPT_BYTES)
             state_path = root / "pmcc_csv_state.json"
             stdout = io.StringIO()
-            with patch.object(pmcc, "load_broker_positions", return_value=([], [], {"source": "stub"})), patch.object(
+            with patch.object(pmcc, "load_broker_positions", return_value=([], [], [], {"source": "stub"})), patch.object(
                 pmcc, "save_broker_positions"
             ), patch.object(
                 pmcc, "print_broker_position_confirmation"

@@ -1,4 +1,5 @@
 import math
+import re
 import time
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -7,7 +8,7 @@ import pandas as pd
 
 from pmcc.constants import OPTION_CHAIN_MIN_INTERVAL_SECONDS
 from pmcc.models import PositionInput, StrategyConfig
-from pmcc.positions import parse_option_code_metadata
+from pmcc.positions import parse_option_code_metadata, position_to_record
 from pmcc.utils import parse_expiry, safe_float, safe_text
 
 LAST_OPTION_CHAIN_REQUEST_AT = 0.0
@@ -580,7 +581,7 @@ def collect_positions_from_opend(
     port: int,
     trd_env: Any = None,
     acc_index: Optional[int] = None,
-) -> Tuple[List[PositionInput], List[PositionInput], dict]:
+) -> Tuple[List[PositionInput], List[PositionInput], List[PositionInput], dict]:
     from futu import OpenSecTradeContext, RET_OK, TrdEnv, TrdMarket
 
     if trd_env is None:
@@ -618,10 +619,11 @@ def collect_positions_from_opend(
 
     base_positions: List[PositionInput] = []
     short_calls: List[PositionInput] = []
+    stock_positions: List[PositionInput] = []
     skipped: List[dict] = []
 
     if positions is None or positions.empty:
-        return [], [], {
+        return [], [], [], {
             "source": "opend",
             "account_count": 0 if accounts is None else len(accounts),
             "queried_account_indices": account_indices,
@@ -637,6 +639,20 @@ def collect_positions_from_opend(
             continue
         quantity = int(round(abs(raw_quantity)))
         if quantity <= 0:
+            continue
+
+        if re.fullmatch(r"US\.[A-Z]{1,6}", code) and raw_quantity > 0:
+            stock_positions.append(
+                PositionInput(
+                    raw_code=code,
+                    underlying=code,
+                    quantity=quantity,
+                    strike=None,
+                    expiry=None,
+                    option_type="STOCK",
+                    cost_price=safe_float(row.get("cost_price")),
+                )
+            )
             continue
 
         meta = parse_option_code_metadata(code)
@@ -686,6 +702,8 @@ def collect_positions_from_opend(
         "short_contracts": sum(item.quantity for item in short_calls),
         "short_call_contracts": sum(item.quantity for item in short_call_positions),
         "short_put_contracts": sum(item.quantity for item in short_put_positions),
+        "stock_positions": [position_to_record(item) for item in stock_positions],
+        "stock_shares": sum(item.quantity for item in stock_positions),
         "skipped": skipped,
     }
-    return base_positions, short_calls, metadata
+    return base_positions, short_calls, stock_positions, metadata

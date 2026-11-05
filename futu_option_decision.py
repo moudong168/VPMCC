@@ -512,26 +512,37 @@ def save_position_memory(
     save_position_memory_to_path(MEMORY_FILE, base_positions, short_calls, memory_scope)
 
 
-def load_broker_positions(path: Path) -> Tuple[List[PositionInput], List[PositionInput], Dict[str, Any]]:
+def load_broker_positions(path: Path) -> Tuple[List[PositionInput], List[PositionInput], List[PositionInput], Dict[str, Any]]:
     payload = read_json_object(path)
     base_positions = positions_from_records(payload.get("base_position_records"))
     short_calls = positions_from_records(payload.get("short_call_records"))
-    return base_positions, short_calls, {
+    stock_positions = positions_from_records(payload.get("stock_position_records"))
+    return base_positions, short_calls, stock_positions, {
         "source": safe_text(payload.get("source")) or "broker_file",
         "path": str(path),
         "loaded": bool(base_positions or short_calls),
         "base_contracts": sum(item.quantity for item in base_positions),
         "short_contracts": sum(item.quantity for item in short_calls),
+        "stock_shares": sum(item.quantity for item in stock_positions),
     }
 
 
-def save_broker_positions(path: Path, broker: str, base_positions: List[PositionInput], short_calls: List[PositionInput]) -> None:
+def save_broker_positions(
+    path: Path,
+    broker: str,
+    base_positions: List[PositionInput],
+    short_calls: List[PositionInput],
+    stock_positions: Optional[List[PositionInput]] = None,
+) -> None:
+    stock_positions = stock_positions or []
     payload = {
         "source": broker,
         "base_positions": positions_to_compact_text(base_positions),
         "short_calls": positions_to_compact_text(short_calls),
+        "stock_positions": positions_to_compact_text(stock_positions),
         "base_position_records": [position_to_record(item) for item in base_positions],
         "short_call_records": [position_to_record(item) for item in short_calls],
+        "stock_position_records": [position_to_record(item) for item in stock_positions],
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
     write_json_object(path, payload)
@@ -739,7 +750,7 @@ def merge_positions_by_code(*sources: Tuple[str, List[PositionInput]]) -> Tuple[
     }
 
 
-def collect_positions_from_opend(trd_env: str = TrdEnv.REAL, acc_index: Optional[int] = None) -> Tuple[List[PositionInput], List[PositionInput], Dict[str, Any]]:
+def collect_positions_from_opend(trd_env: str = TrdEnv.REAL, acc_index: Optional[int] = None) -> Tuple[List[PositionInput], List[PositionInput], List[PositionInput], Dict[str, Any]]:
     return collect_positions_from_opend_from_futu(HOST, PORT, trd_env=trd_env, acc_index=acc_index)
 
 
@@ -3559,7 +3570,9 @@ def analyze_pmcc_symbol(
     config: StrategyConfig,
     portfolio_identity: Optional[Dict[str, Any]] = None,
     use_cboe: bool = False,
+    stock_positions: Optional[List[PositionInput]] = None,
 ) -> Dict[str, Any]:
+    stock_positions = stock_positions or []
     short_call_legs = [item for item in short_calls if item.option_type == "CALL"]
     short_put_legs = [item for item in short_calls if item.option_type == "PUT"]
     other_short_legs = [item for item in short_calls if item.option_type not in {"CALL", "PUT"}]
@@ -3627,13 +3640,24 @@ def analyze_pmcc_symbol(
         {"code": item.raw_code, "quantity": item.quantity, "strike": item.strike, "expiry": item.expiry, "cost_price": item.cost_price, "option_type": item.option_type}
         for item in other_short_legs
     ]
+    result["stock_positions"] = [
+        {"code": item.raw_code, "quantity": item.quantity, "cost_price": item.cost_price}
+        for item in stock_positions
+    ]
+    stock_shares = sum(item.quantity for item in stock_positions)
+    stock_cover_contracts = stock_shares // 100
+    base_contracts = sum(item.quantity for item in base_positions)
+    short_call_contracts = sum(item.quantity for item in short_call_legs)
+    coverage_available = max(base_contracts + stock_cover_contracts - short_call_contracts, 0)
     result["coverage"] = {
-        "base_contracts": sum(item.quantity for item in base_positions),
-        "short_call_contracts": sum(item.quantity for item in short_call_legs),
+        "base_contracts": base_contracts,
+        "short_call_contracts": short_call_contracts,
         "short_put_contracts": sum(item.quantity for item in short_put_legs),
         "other_short_contracts": sum(item.quantity for item in other_short_legs),
-        "available_to_sell": max(sum(item.quantity for item in base_positions) - sum(item.quantity for item in short_call_legs), 0),
-        "max_new_short_calls": max(sum(item.quantity for item in base_positions) - sum(item.quantity for item in short_call_legs), 0),
+        "stock_shares": stock_shares,
+        "stock_cover_contracts": stock_cover_contracts,
+        "available_to_sell": coverage_available,
+        "max_new_short_calls": coverage_available,
         "coverage_scope": "per_underlying_only",
         "coverage_scope_cn": "覆盖额度按同一标的分别计算，不能用其他标的的 LEAPS 混合覆盖。",
     }
@@ -3847,7 +3871,8 @@ def analyze_pmcc_symbol(
         if result.get("coverage", {}).get("available_to_sell") == 0:
             result["summary_cn"] += " 当前 short call 数量已达到 LEAPS 底仓可覆盖上限，暂不建议新增卖出 short call。"
 
-    shared_ctx.close()
+    if shared_ctx is not None:
+        shared_ctx.close()
     return result
 
 
@@ -3976,6 +4001,7 @@ def split_pmcc_result(result: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str,
         "current_short_calls",
         "current_short_puts",
         "other_short_legs",
+        "stock_positions",
         "coverage",
         "long_leg_analysis",
         "leaps_coverage_slots",
@@ -4012,8 +4038,10 @@ def build_pmcc_two_stage_result(
     memory_scope: str = "analysis_snapshot",
     save_memory: bool = True,
     use_cboe: bool = False,
+    stock_positions: Optional[List[PositionInput]] = None,
 ) -> Dict[str, Any]:
     print_position_inventory_before_analysis(base_positions, short_calls)
+    stock_positions = stock_positions or []
     if save_memory:
         save_position_memory(
             memory_save_base_positions if memory_save_base_positions is not None else base_positions,
@@ -4022,7 +4050,8 @@ def build_pmcc_two_stage_result(
         )
     grouped_bases = group_positions_by_underlying(base_positions)
     grouped_shorts = group_positions_by_underlying(short_calls)
-    symbols = sorted(set(grouped_bases) | set(grouped_shorts))
+    grouped_stocks = group_positions_by_underlying(stock_positions)
+    symbols = sorted(set(grouped_bases) | set(grouped_shorts) | set(grouped_stocks))
     iv_rank_metadata = build_iv_rank_input_metadata(symbols, config)
     source_metadata = {
         **source_metadata,
@@ -4042,6 +4071,10 @@ def build_pmcc_two_stage_result(
             "symbol": symbol,
         }
         try:
+            analyze_kwargs: Dict[str, Any] = {}
+            symbol_stocks = grouped_stocks.get(symbol) or []
+            if symbol_stocks:
+                analyze_kwargs["stock_positions"] = symbol_stocks
             result = analyze_pmcc_symbol(
                 symbol,
                 grouped_bases.get(symbol, []),
@@ -4049,6 +4082,7 @@ def build_pmcc_two_stage_result(
                 config,
                 portfolio_identity,
                 use_cboe=use_cboe,
+                **analyze_kwargs,
             )
         except Exception as exc:
             result = {"symbol": symbol, "error": enrich_error_message(str(exc)), "portfolio_id": portfolio_id, "portfolio_label": portfolio_label}
@@ -4069,6 +4103,7 @@ def build_pmcc_two_stage_result(
         "recorded_positions": {
             "base_positions": [position_to_record(item) for item in base_positions],
             "short_calls": [position_to_record(item) for item in short_calls],
+            "stock_positions": [position_to_record(item) for item in stock_positions],
             "memory_file": str(MEMORY_FILE),
             "portfolio_id": portfolio_id,
             "portfolio_label": portfolio_label,
@@ -4092,6 +4127,7 @@ def build_pmcc_multi_portfolio_result(
     for portfolio in portfolios:
         portfolio_base_positions = portfolio.get("base_positions") or []
         portfolio_short_calls = portfolio.get("short_calls") or []
+        portfolio_stock_positions = portfolio.get("stock_positions") or []
         portfolio_metadata = {
             "source": portfolio.get("source"),
             "portfolio_id": portfolio.get("portfolio_id"),
@@ -4104,6 +4140,7 @@ def build_pmcc_multi_portfolio_result(
             config,
             save_memory=False,
             use_cboe=use_cboe,
+            stock_positions=portfolio_stock_positions,
         )
         stage_1.extend(child["stage_1_position_analysis"])
         stage_2.extend(child["stage_2_operation_recommendations"])
@@ -4113,12 +4150,14 @@ def build_pmcc_multi_portfolio_result(
                 "portfolio_label": portfolio.get("portfolio_label"),
                 "base_positions": [position_to_record(item) for item in portfolio_base_positions],
                 "short_calls": [position_to_record(item) for item in portfolio_short_calls],
+                "stock_positions": [position_to_record(item) for item in portfolio_stock_positions],
             }
         )
         portfolio_sources.append(child["position_source"])
 
     all_base_positions = [item for portfolio in portfolios for item in (portfolio.get("base_positions") or [])]
     all_short_calls = [item for portfolio in portfolios for item in (portfolio.get("short_calls") or [])]
+    all_stock_positions = [item for portfolio in portfolios for item in (portfolio.get("stock_positions") or [])]
     short_call_legs = [item for item in all_short_calls if item.option_type == "CALL"]
     short_put_legs = [item for item in all_short_calls if item.option_type == "PUT"]
     other_short_legs = [item for item in all_short_calls if item.option_type not in {"CALL", "PUT"}]
@@ -4135,11 +4174,13 @@ def build_pmcc_multi_portfolio_result(
             "total_short_call_contracts": sum(item.quantity for item in short_call_legs),
             "total_short_put_contracts": sum(item.quantity for item in short_put_legs),
             "total_other_short_contracts": sum(item.quantity for item in other_short_legs),
+            "total_stock_shares": sum(item.quantity for item in all_stock_positions),
         },
         "recorded_positions": {
             "portfolios": recorded_portfolios,
             "base_positions": [position_to_record(item) for item in all_base_positions],
             "short_calls": [position_to_record(item) for item in all_short_calls],
+            "stock_positions": [position_to_record(item) for item in all_stock_positions],
             "memory_file": str(MEMORY_FILE),
             "memory_scope": "broker_isolated_snapshots",
         },
@@ -4169,48 +4210,48 @@ def run_pmcc_csv(config: StrategyConfig, csv_dir: Path) -> Dict[str, Any]:
     state = load_csv_state(CSV_STATE_FILE)
     state_files = dict(state.get("files") or {})
 
-    futu_base_positions, futu_short_calls, futu_metadata = load_broker_positions(FUTU_POSITIONS_FILE)
-    schwab_base_positions, schwab_short_calls, schwab_metadata = load_broker_positions(SCHWAB_POSITIONS_FILE)
+    futu_base_positions, futu_short_calls, futu_stocks, futu_metadata = load_broker_positions(FUTU_POSITIONS_FILE)
+    schwab_base_positions, schwab_short_calls, schwab_stocks, schwab_metadata = load_broker_positions(SCHWAB_POSITIONS_FILE)
 
     def _refresh_from_csv(
         broker: str,
         positions_file: Path,
         csv_path: Optional[Path],
         parse_fn,
-    ) -> Tuple[List[PositionInput], List[PositionInput], Dict[str, Any]]:
-        base_positions, short_calls, metadata = load_broker_positions(positions_file)
+    ) -> Tuple[List[PositionInput], List[PositionInput], List[PositionInput], Dict[str, Any]]:
+        base_positions, short_calls, stock_positions, metadata = load_broker_positions(positions_file)
         record = state_files.get(broker)
         if csv_path is None:
             print(f"[CSV] {broker}: no CSV found in {csv_dir}; reusing saved positions "
                   f"({metadata.get('base_contracts', 0)} base / {metadata.get('short_contracts', 0)} short).")
-            return base_positions, short_calls, {**metadata, "csv_mode": "reuse_saved_no_csv_found"}
+            return base_positions, short_calls, stock_positions, {**metadata, "csv_mode": "reuse_saved_no_csv_found"}
         if not is_new_csv(csv_path, record):
             print(f"[CSV] {broker}: {csv_path.name} already consumed; reusing saved positions "
                   f"({metadata.get('base_contracts', 0)} base / {metadata.get('short_contracts', 0)} short).")
-            return base_positions, short_calls, {**metadata, "csv_mode": "reuse_saved_csv_unchanged"}
+            return base_positions, short_calls, stock_positions, {**metadata, "csv_mode": "reuse_saved_csv_unchanged"}
         try:
-            parsed_base, parsed_shorts, parse_meta = parse_fn(csv_path)
+            parsed_base, parsed_shorts, parsed_stocks, parse_meta = parse_fn(csv_path)
         except Exception as exc:
             print(f"[CSV] WARNING: failed to parse {csv_path.name}: {exc}; reusing saved positions.")
-            return base_positions, short_calls, {**metadata, "csv_mode": "reuse_saved_parse_failed"}
+            return base_positions, short_calls, stock_positions, {**metadata, "csv_mode": "reuse_saved_parse_failed"}
         if not parse_meta.get("rows_seen"):
             print(f"[CSV] WARNING: {csv_path.name} has no data rows; reusing saved positions.")
-            return base_positions, short_calls, {**metadata, "csv_mode": "reuse_saved_csv_empty"}
-        save_broker_positions(positions_file, f"{broker}_csv_positions", parsed_base, parsed_shorts)
+            return base_positions, short_calls, stock_positions, {**metadata, "csv_mode": "reuse_saved_csv_empty"}
+        save_broker_positions(positions_file, f"{broker}_csv_positions", parsed_base, parsed_shorts, parsed_stocks)
         state_files[broker] = {"name": csv_path.name, "mtime": csv_path.stat().st_mtime}
         print(f"[CSV] {broker}: loaded {csv_path.name} -> "
               f"{parse_meta.get('base_contracts', 0)} base / {parse_meta.get('short_contracts', 0)} short "
               f"({len(parse_meta.get('skipped') or [])} rows skipped).")
-        return parsed_base, parsed_shorts, {
+        return parsed_base, parsed_shorts, parsed_stocks, {
             **parse_meta,
             "csv_mode": "loaded_from_csv",
             "csv_file": csv_path.name,
         }
 
-    futu_base_positions, futu_short_calls, futu_csv_meta = _refresh_from_csv(
+    futu_base_positions, futu_short_calls, futu_stocks, futu_csv_meta = _refresh_from_csv(
         "futu", FUTU_POSITIONS_FILE, latest.get("futu"), parse_futu_position_csv
     )
-    schwab_base_positions, schwab_short_calls, schwab_csv_meta = _refresh_from_csv(
+    schwab_base_positions, schwab_short_calls, schwab_stocks, schwab_csv_meta = _refresh_from_csv(
         "schwab", SCHWAB_POSITIONS_FILE, latest.get("schwab"), parse_schwab_position_statement
     )
     save_csv_state(CSV_STATE_FILE, state_files)
@@ -4259,6 +4300,7 @@ def run_pmcc_csv(config: StrategyConfig, csv_dir: Path) -> Dict[str, Any]:
                 "source": futu_csv_meta.get("source") or "futu_csv_positions",
                 "base_positions": futu_base_positions,
                 "short_calls": futu_short_calls,
+                "stock_positions": futu_stocks,
             },
             {
                 "portfolio_id": "SCHWAB",
@@ -4266,6 +4308,7 @@ def run_pmcc_csv(config: StrategyConfig, csv_dir: Path) -> Dict[str, Any]:
                 "source": schwab_csv_meta.get("source") or "schwab_csv_positions",
                 "base_positions": schwab_base_positions,
                 "short_calls": schwab_short_calls,
+                "stock_positions": schwab_stocks,
             },
         ],
         config,
@@ -4312,6 +4355,7 @@ def _schwab_auto_decision(mode: str, csv_path: Optional[Path] = None, **extra: A
         "csv_path": csv_path,
         "base_positions": [],
         "short_calls": [],
+        "stock_positions": [],
         "metadata": {},
         "state_record": None,
         "error": "",
@@ -4324,6 +4368,7 @@ def resolve_auto_schwab_import(
     explicit_path: str = "",
     directories: Optional[Sequence[Path]] = None,
     state_path: Optional[Path] = None,
+    snapshot_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Decide how run_pmcc_opend should obtain the Schwab positions.
 
@@ -4333,6 +4378,12 @@ def resolve_auto_schwab_import(
     - ``already_consumed``: newest CSV matches the saved ``schwab_opend`` record.
     - ``parse_failed``: newest CSV exists but is unusable; retried on the next run.
     - ``none``: no Schwab CSV in any scanned directory.
+
+    Schema guard: an ``already_consumed`` verdict is dropped when the saved
+    positions snapshot is readable JSON but lacks the ``stock_position_records``
+    key (i.e. it was written by an older program version), so the CSV is
+    re-parsed. A missing snapshot, a non-dict payload, or the key being present
+    (even as an empty list) keeps the original ``already_consumed`` behaviour.
 
     Parsing happens here inside try/except so a bad CSV can never abort a run and
     never advances the ``schwab_opend`` state record.
@@ -4346,10 +4397,20 @@ def resolve_auto_schwab_import(
     if csv_path is None:
         return _schwab_auto_decision("none")
     saved_record = (load_csv_state(state_file).get("files") or {}).get(SCHWAB_OPEND_CSV_STATE_KEY)
+    snapshot_file = Path(snapshot_path) if snapshot_path is not None else SCHWAB_POSITIONS_FILE
     if not is_new_csv(csv_path, saved_record):
-        return _schwab_auto_decision("already_consumed", csv_path)
+        legacy_snapshot = False
+        if snapshot_file.exists():
+            try:
+                snapshot_payload = json.loads(snapshot_file.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                snapshot_payload = None
+            if isinstance(snapshot_payload, dict) and "stock_position_records" not in snapshot_payload:
+                legacy_snapshot = True
+        if not legacy_snapshot:
+            return _schwab_auto_decision("already_consumed", csv_path)
     try:
-        base_positions, short_calls, metadata = parse_schwab_position_statement(csv_path)
+        base_positions, short_calls, stock_positions, metadata = parse_schwab_position_statement(csv_path)
     except Exception as exc:  # noqa: BLE001 - a broken export must never break the run
         return _schwab_auto_decision("parse_failed", csv_path, error=str(exc))
     if not metadata.get("rows_seen"):
@@ -4363,6 +4424,7 @@ def resolve_auto_schwab_import(
         csv_path,
         base_positions=base_positions,
         short_calls=short_calls,
+        stock_positions=stock_positions,
         metadata=metadata,
         state_record={"name": csv_path.name, "mtime": mtime},
     )
@@ -4393,18 +4455,18 @@ def run_pmcc_opend(
     use_cboe: bool = False,
     auto_schwab_dirs: Optional[Sequence[Path]] = None,
 ) -> Dict[str, Any]:
-    previous_futu_base_positions, previous_futu_short_calls, previous_futu_metadata = load_broker_positions(FUTU_POSITIONS_FILE)
-    schwab_base_positions, schwab_short_calls, schwab_metadata = load_broker_positions(SCHWAB_POSITIONS_FILE)
+    previous_futu_base_positions, previous_futu_short_calls, previous_futu_stocks, previous_futu_metadata = load_broker_positions(FUTU_POSITIONS_FILE)
+    schwab_base_positions, schwab_short_calls, schwab_stocks, schwab_metadata = load_broker_positions(SCHWAB_POSITIONS_FILE)
     if use_cboe:
-        opend_base_positions, opend_short_calls, opend_metadata = [], [], {"source": "cboe_skipped", "base_contracts": 0, "short_call_contracts": 0}
+        opend_base_positions, opend_short_calls, opend_stocks, opend_metadata = [], [], [], {"source": "cboe_skipped", "base_contracts": 0, "short_call_contracts": 0}
         print("[CBOE mode] Skipped Futu OpenD position collection; using saved JSON positions.")
     else:
-        opend_base_positions, opend_short_calls, opend_metadata = collect_positions_from_opend()
+        opend_base_positions, opend_short_calls, opend_stocks, opend_metadata = collect_positions_from_opend()
     futu_position_diff = {
         "base_positions": diff_positions_by_code(previous_futu_base_positions, opend_base_positions),
         "short_positions": diff_positions_by_code(previous_futu_short_calls, opend_short_calls),
     }
-    save_broker_positions(FUTU_POSITIONS_FILE, "futu_opend_snapshot", opend_base_positions, opend_short_calls)
+    save_broker_positions(FUTU_POSITIONS_FILE, "futu_opend_snapshot", opend_base_positions, opend_short_calls, opend_stocks)
 
     if auto_schwab_dirs is None:
         program_dir = Path(__file__).resolve().parent
@@ -4415,7 +4477,7 @@ def run_pmcc_opend(
         state_path=CSV_STATE_FILE,
     )
     if auto_schwab_import["mode"] == "explicit":
-        schwab_base_positions, schwab_short_calls, schwab_change_metadata = parse_tos_position_statement(
+        schwab_base_positions, schwab_short_calls, schwab_stocks, schwab_change_metadata = parse_tos_position_statement(
             Path(schwab_import_positions_path)
         )
         schwab_change_metadata = {
@@ -4425,6 +4487,7 @@ def run_pmcc_opend(
     elif auto_schwab_import["mode"] == "auto_import":
         schwab_base_positions = auto_schwab_import["base_positions"]
         schwab_short_calls = auto_schwab_import["short_calls"]
+        schwab_stocks = auto_schwab_import["stock_positions"]
         schwab_change_metadata = {
             **auto_schwab_import["metadata"],
             "mode": "replace_from_auto_schwab_position_statement",
@@ -4478,7 +4541,7 @@ def run_pmcc_opend(
             "base_contracts": 0,
             "short_call_contracts": 0,
         }
-    save_broker_positions(SCHWAB_POSITIONS_FILE, "schwab_manual_positions", schwab_base_positions, schwab_short_calls)
+    save_broker_positions(SCHWAB_POSITIONS_FILE, "schwab_manual_positions", schwab_base_positions, schwab_short_calls, schwab_stocks)
     if auto_schwab_import["mode"] == "auto_import":
         remember_schwab_opend_csv(auto_schwab_import.get("state_record"), CSV_STATE_FILE)
     print_broker_position_confirmation(
@@ -4539,6 +4602,7 @@ def run_pmcc_opend(
                 "source": "futu_opend",
                 "base_positions": opend_base_positions,
                 "short_calls": opend_short_calls,
+                "stock_positions": opend_stocks,
             },
             {
                 "portfolio_id": "SCHWAB",
@@ -4546,6 +4610,7 @@ def run_pmcc_opend(
                 "source": "schwab_manual",
                 "base_positions": schwab_base_positions,
                 "short_calls": schwab_short_calls,
+                "stock_positions": schwab_stocks,
             },
         ],
         config,

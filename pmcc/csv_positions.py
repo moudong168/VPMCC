@@ -56,10 +56,14 @@ def tos_option_code(underlying: str, instrument: str) -> Optional[str]:
     return f"US.{underlying.upper()}{match.group('year')}{month}{day:02d}{cp}{strike_code}"
 
 
-def parse_schwab_position_statement(path: Path) -> Tuple[List[PositionInput], List[PositionInput], Dict[str, Any]]:
+STOCK_CODE_RE = re.compile(r"[A-Z]{1,6}")
+
+
+def parse_schwab_position_statement(path: Path) -> Tuple[List[PositionInput], List[PositionInput], List[PositionInput], Dict[str, Any]]:
     path = Path(str(path).strip())
     base_positions: List[PositionInput] = []
     short_positions: List[PositionInput] = []
+    stock_positions: List[PositionInput] = []
     skipped: List[Dict[str, Any]] = []
     current_underlying: Optional[str] = None
     rows_seen = 0
@@ -81,6 +85,24 @@ def parse_schwab_position_statement(path: Path) -> Tuple[List[PositionInput], Li
                 continue
 
             if not instrument.startswith("100 "):
+                if STOCK_CODE_RE.fullmatch(instrument) and qty_text is not None:
+                    quantity_signed = safe_int(qty_text)
+                    if quantity_signed is None or quantity_signed == 0:
+                        skipped.append({"instrument": instrument, "qty": qty_text, "reason": "zero_or_missing_quantity"})
+                    elif quantity_signed > 0:
+                        stock_positions.append(
+                            PositionInput(
+                                raw_code="US." + instrument,
+                                underlying="US." + instrument,
+                                quantity=quantity_signed,
+                                strike=None,
+                                expiry=None,
+                                option_type="STOCK",
+                                cost_price=trade_price,
+                            )
+                        )
+                    else:
+                        skipped.append({"instrument": instrument, "qty": qty_text, "reason": "short_stock_unsupported"})
                 continue
             if current_underlying is None:
                 skipped.append({"instrument": instrument, "reason": "missing_underlying"})
@@ -110,14 +132,20 @@ def parse_schwab_position_statement(path: Path) -> Tuple[List[PositionInput], Li
             else:
                 skipped.append({"instrument": instrument, "qty": qty_text, "reason": "long_put_not_pmcc_base"})
 
-    return combine_positions_by_code(base_positions), combine_positions_by_code(short_positions), {
-        "source": "thinkorswim_position_statement",
-        "path": str(path),
-        "rows_seen": rows_seen,
-        "base_contracts": sum(item.quantity for item in base_positions),
-        "short_contracts": sum(item.quantity for item in short_positions),
-        "skipped": skipped,
-    }
+    return (
+        combine_positions_by_code(base_positions),
+        combine_positions_by_code(short_positions),
+        combine_positions_by_code(stock_positions),
+        {
+            "source": "thinkorswim_position_statement",
+            "path": str(path),
+            "rows_seen": rows_seen,
+            "base_contracts": sum(item.quantity for item in base_positions),
+            "short_contracts": sum(item.quantity for item in short_positions),
+            "stock_shares": sum(item.quantity for item in stock_positions),
+            "skipped": skipped,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -128,17 +156,19 @@ FUTU_POSITION_CSV_GLOBS = ["持仓-*.csv"]
 FUTU_OPTION_CODE_RE = re.compile(r"^([A-Z]+)(\d{6})([CP])(\d+)$")
 
 
-def parse_futu_position_csv(path: Path) -> Tuple[List[PositionInput], List[PositionInput], Dict[str, Any]]:
+def parse_futu_position_csv(path: Path) -> Tuple[List[PositionInput], List[PositionInput], List[PositionInput], Dict[str, Any]]:
     """Parse a Futu 保证金综合账户 position export CSV.
 
-    Only option legs become PMCC positions: positive-quantity CALLs are treated
-    as base (LEAPS) legs, negative quantities as short legs (calls and puts).
-    Stock rows, strategy-summary rows (e.g. ``MSFT270617C390/480``) and
-    zero-quantity rows are skipped and reported in metadata.
+    Positive-quantity CALLs become PMCC base (LEAPS) legs, negative quantities
+    become short legs (calls and puts). Positive-quantity stock rows become
+    stock positions (``option_type="STOCK"``). Short stock rows, strategy-summary
+    rows (e.g. ``MSFT270617C390/480``) and zero-quantity rows are skipped and
+    reported in metadata.
     """
     path = Path(str(path).strip())
     base_positions: List[PositionInput] = []
     short_positions: List[PositionInput] = []
+    stock_positions: List[PositionInput] = []
     skipped: List[Dict[str, Any]] = []
     rows_seen = 0
 
@@ -154,10 +184,29 @@ def parse_futu_position_csv(path: Path) -> Tuple[List[PositionInput], List[Posit
             if "/" in code_raw:
                 skipped.append({"code": code_raw, "reason": "strategy_summary_row"})
                 continue
-            if not FUTU_OPTION_CODE_RE.match(code_raw.strip().upper()):
-                continue
             qty_text = safe_text(row[2]) if len(row) > 2 else None
             cost_price = safe_float(row[4]) if len(row) > 4 else None
+            if not FUTU_OPTION_CODE_RE.match(code_raw.strip().upper()):
+                bare_code = re.sub(r"^US\.", "", code_raw.strip().upper())
+                if STOCK_CODE_RE.fullmatch(bare_code):
+                    quantity_signed = safe_int(qty_text)
+                    if quantity_signed is None or quantity_signed == 0:
+                        skipped.append({"code": code_raw, "qty": qty_text, "reason": "zero_or_missing_quantity"})
+                    elif quantity_signed > 0:
+                        stock_positions.append(
+                            PositionInput(
+                                raw_code="US." + bare_code,
+                                underlying="US." + bare_code,
+                                quantity=quantity_signed,
+                                strike=None,
+                                expiry=None,
+                                option_type="STOCK",
+                                cost_price=cost_price,
+                            )
+                        )
+                    else:
+                        skipped.append({"code": code_raw, "qty": qty_text, "reason": "short_stock_unsupported"})
+                continue
             quantity_signed = safe_int(qty_text)
             if quantity_signed is None or quantity_signed == 0:
                 skipped.append({"code": code_raw, "qty": qty_text, "reason": "zero_or_missing_quantity"})
@@ -180,14 +229,20 @@ def parse_futu_position_csv(path: Path) -> Tuple[List[PositionInput], List[Posit
             else:
                 skipped.append({"code": code_raw, "qty": qty_text, "reason": "long_put_not_pmcc_base"})
 
-    return combine_positions_by_code(base_positions), combine_positions_by_code(short_positions), {
-        "source": "futu_position_csv",
-        "path": str(path),
-        "rows_seen": rows_seen,
-        "base_contracts": sum(item.quantity for item in base_positions),
-        "short_contracts": sum(item.quantity for item in short_positions),
-        "skipped": skipped,
-    }
+    return (
+        combine_positions_by_code(base_positions),
+        combine_positions_by_code(short_positions),
+        combine_positions_by_code(stock_positions),
+        {
+            "source": "futu_position_csv",
+            "path": str(path),
+            "rows_seen": rows_seen,
+            "base_contracts": sum(item.quantity for item in base_positions),
+            "short_contracts": sum(item.quantity for item in short_positions),
+            "stock_shares": sum(item.quantity for item in stock_positions),
+            "skipped": skipped,
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

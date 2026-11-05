@@ -47,7 +47,7 @@ class CsvPositionsTests(unittest.TestCase):
     def test_parse_schwab_statement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(Path(tmp), "2026-09-29-PositionStatement.csv", SCHWAB_SAMPLE)
-            base, shorts, meta = parse_schwab_position_statement(path)
+            base, shorts, stocks, meta = parse_schwab_position_statement(path)
         self.assertEqual(meta["rows_seen"], 10)
         # base: GOOGL 330C x1, MSFT 330C x1 ; shorts: GOOGL 365C x1, MSFT 480C x3
         self.assertEqual(sum(p.quantity for p in base), 2)
@@ -62,7 +62,7 @@ class CsvPositionsTests(unittest.TestCase):
     def test_parse_futu_csv(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(Path(tmp), "持仓-保证金综合账户(XXXX)-20260929-221417.csv", FUTU_SAMPLE)
-            base, shorts, meta = parse_futu_position_csv(path)
+            base, shorts, stocks, meta = parse_futu_position_csv(path)
         # stocks skipped, strategy row skipped, zero-qty skipped
         self.assertEqual(len(base), 1)
         self.assertEqual(len(shorts), 2)

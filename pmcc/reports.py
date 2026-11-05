@@ -975,11 +975,13 @@ def build_html_report(
   <main class="report-shell">
     {html_report_header(generated_at, report_version, source, len(recommendations), data_source_banner)}
 
+    <nav class="report-nav"><a class="nav-positions" href="#zone-positions">持仓确认</a><a class="nav-ledger" href="#zone-ledger">平台台账</a><a class="nav-details" href="#zone-details">标的详情</a><a class="nav-raw" href="#zone-raw">原始数据</a></nav>
+
     {position_sections}
 
     {html_platform_ledger_sections(recommendation_rows)}
 
-    <section class="grid">
+    <section class="grid" id="zone-details">
       {"".join(detail_cards)}
     </section>
 
@@ -1395,8 +1397,8 @@ def html_report_css() -> str:
     }
     .platform-ledger + .platform-ledger { margin-top:26px; }
     .card {
-      background:var(--panel);
-      border:1px solid var(--line);
+      background:#fffaf0;
+      border:1px solid #eadfc8;
       border-radius:8px;
       padding:22px;
       box-shadow:var(--shadow-soft);
@@ -1406,6 +1408,8 @@ def html_report_css() -> str:
       align-items:center;
       gap:10px;
       padding-bottom:12px;
+      padding-left:10px;
+      border-left:4px solid #d97706;
       border-bottom:1px solid var(--line);
     }
     .summary { line-height:1.75; color:#334155; }
@@ -1440,6 +1444,37 @@ def html_report_css() -> str:
     details { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px 16px; box-shadow:var(--shadow-soft); }
     summary { cursor:pointer; font-weight:700; color:#243b5a; }
     pre { white-space:pre-wrap; word-break:break-word; font-size:12px; color:#101828; }
+    .zone-positions { background:#edf4ff; border-left:5px solid #2463eb; }
+    .zone-positions h2 { color:#173f91; }
+    .zone-ledger { background:#e9f9f1; border-left:5px solid #0f766e; }
+    .zone-ledger h2 { color:#065f46; }
+    .zone-raw { background:#1f2937; }
+    .zone-raw summary { color:#f9fafb; font-weight:700; }
+    .zone-raw pre { color:#d1d5db; }
+    .report-nav {
+      background:#ffffff;
+      border:1px solid var(--line);
+      border-radius:8px;
+      padding:10px 14px;
+      margin:0 0 20px;
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+    }
+    .report-nav a {
+      text-decoration:none;
+      color:var(--text);
+      font-size:13px;
+      font-weight:650;
+      padding:6px 10px;
+      background:var(--panel-soft);
+      border-radius:6px;
+      border-left:4px solid var(--line);
+    }
+    .report-nav a.nav-positions { border-left-color:#2463eb; }
+    .report-nav a.nav-ledger { border-left-color:#0f766e; }
+    .report-nav a.nav-details { border-left-color:#d97706; }
+    .report-nav a.nav-raw { border-left-color:#1f2937; }
     .empty { color:var(--muted); text-align:center; background:#f8fafc; }
     @media (max-width: 980px) {
       .report-shell { padding:20px 14px 32px; }
@@ -1489,17 +1524,18 @@ def portfolio_display_name(item: Dict[str, Any]) -> str:
 def html_recorded_positions_section(recorded: Dict[str, Any]) -> str:
     portfolios = recorded.get("portfolios") or []
     if not portfolios:
-        position_rows = build_html_position_rows(recorded.get("base_positions", []), recorded.get("short_calls", []))
+        position_rows = build_html_position_rows(recorded.get("base_positions", []), recorded.get("short_calls", []), recorded.get("stock_positions", []))
         return html_positions_section(
             position_rows["base_rows"],
             position_rows["short_call_rows"],
             position_rows["short_put_rows"],
             position_rows["other_short_rows"],
+            stock_rows=position_rows["stock_rows"],
         )
 
-    sections: List[str] = ['<section class="section"><h2>本次持仓确认</h2><p class="muted">按平台/账户分别确认；不同平台之间不互相覆盖。</p>']
+    sections: List[str] = ['<section class="section zone-positions" id="zone-positions"><h2>本次持仓确认</h2><p class="muted">按平台/账户分别确认；不同平台之间不互相覆盖。</p>']
     for portfolio in portfolios:
-        position_rows = build_html_position_rows(portfolio.get("base_positions", []), portfolio.get("short_calls", []))
+        position_rows = build_html_position_rows(portfolio.get("base_positions", []), portfolio.get("short_calls", []), portfolio.get("stock_positions", []))
         label = portfolio_display_name(portfolio)
         sections.append(f"<h3>{html_text(label)}</h3>")
         sections.append("<h4>LEAPS / 底仓</h4>")
@@ -1510,6 +1546,9 @@ def html_recorded_positions_section(recorded: Dict[str, Any]) -> str:
         sections.append(html_table(["标的", "合约代码", "数量", "行权价", "到期日", "成本"], position_rows["short_put_rows"]))
         sections.append("<h4>其他 Short Option</h4>")
         sections.append(html_table(["标的", "合约代码", "数量", "行权价", "到期日", "类型", "成本"], position_rows["other_short_rows"]))
+        if position_rows["stock_rows"]:
+            sections.append("<h3>正股持仓</h3>")
+            sections.append(html_table(["标的", "代码", "股数", "到期", "成本价"], position_rows["stock_rows"]))
     sections.append("</section>")
     return "\n".join(sections)
 
@@ -1552,7 +1591,7 @@ def html_platform_ledger_sections(recommendation_rows: Dict[str, Any]) -> str:
         put_payoff = next((group for group in put_payoff_groups if group["portfolio"] == portfolio), {"rows": []})
         sections.append(
             f"""
-    <section class="section platform-ledger">
+    <section class="section platform-ledger zone-ledger" id="zone-ledger">
       <div class="section-title"><h2>{html_text(portfolio)}</h2><span class="muted">同平台内独立判断覆盖、ROLL 和新增卖出</span></div>
       {html_table(["标的", "现价", "趋势", "IVR", "IV环境", "底仓", "已卖Call", "可卖Call", "风险灯", "数据校验", "新增卖CALL"], overview["rows"], overview["classes"])}
       <h3>今日优先事项</h3>
@@ -1578,9 +1617,15 @@ def html_positions_section(
     short_call_rows: List[List[Any]],
     short_put_rows: List[List[Any]],
     other_short_rows: List[List[Any]],
+    stock_rows: Optional[List[List[Any]]] = None,
 ) -> str:
+    stock_section = ""
+    if stock_rows:
+        stock_section = f"""
+      <h3>正股持仓</h3>
+      {html_table(["标的", "代码", "股数", "到期", "成本价"], stock_rows)}"""
     return f"""
-    <section class="section">
+    <section class="section zone-positions" id="zone-positions">
       <h2>本次持仓确认</h2>
       <h3>LEAPS / 底仓</h3>
       {html_table(["标的", "合约代码", "数量", "行权价", "到期日", "成本"], base_rows)}
@@ -1589,14 +1634,14 @@ def html_positions_section(
       <h3>已卖 Short Put / CSP</h3>
       {html_table(["标的", "合约代码", "数量", "行权价", "到期日", "成本"], short_put_rows)}
       <h3>其他 Short Option</h3>
-      {html_table(["标的", "合约代码", "数量", "行权价", "到期日", "类型", "成本"], other_short_rows)}
+      {html_table(["标的", "合约代码", "数量", "行权价", "到期日", "类型", "成本"], other_short_rows)}{stock_section}
     </section>
 """
 
 
 def html_overview_section(overview_rows: List[List[Any]], overview_classes: List[str]) -> str:
     return f"""
-    <section class="section">
+    <section class="section zone-ledger">
       <div class="section-title"><h2>平台分组总览</h2><span class="muted">先看风险灯，再看动作；覆盖能力只在同平台内计算</span></div>
       {html_table(["平台", "标的", "现价", "趋势", "IVR", "IV环境", "底仓", "已卖Call", "可卖Call", "风险灯", "数据校验", "新增卖CALL"], overview_rows, overview_classes)}
     </section>
@@ -1605,7 +1650,7 @@ def html_overview_section(overview_rows: List[List[Any]], overview_classes: List
 
 def html_priority_section(priority_rows: List[List[Any]], priority_classes: List[str]) -> str:
     return f"""
-    <section class="section">
+    <section class="section zone-ledger">
       <h2>今日优先事项</h2>
       {html_table(["Light", "State", "Portfolio", "Symbol", "Type", "Short Leg", "Strike", "DTE", "Delta", "Distance%", "Profit%", "Action"], priority_rows, priority_classes)}
     </section>
@@ -1619,7 +1664,7 @@ def html_short_put_payoff_section(
 ) -> str:
     summary = " | ".join(put_payoff_summaries) if put_payoff_summaries else "No short put payoff scenarios available."
     return f"""
-    <section class="section">
+    <section class="section zone-ledger">
       <div class="section-title"><h2>Short Put Expiration P/L</h2><span class="muted">OptionLab-style static payoff scenarios</span></div>
       {html_table(["Portfolio", "Symbol", "Put", "Action Advice", "Next Trigger"], put_advice_rows)}
       {html_table(["Portfolio", "Symbol", "Put", "Spot@Exp", "Spot Chg%", "Intrinsic", "P/L per sh", "P/L total", "Assigned", "Eff. Cost"], put_payoff_rows)}
@@ -1630,7 +1675,7 @@ def html_short_put_payoff_section(
 
 def html_sell_section(sell_rows: List[List[Any]]) -> str:
     return f"""
-    <section class="section">
+    <section class="section zone-ledger">
       <h2>新增卖CALL判断</h2>
       {html_table(["平台", "标的", "结论", "候选合约", "行权价", "DTE", "Delta", "可卖", "保护线", "Liquidity"], sell_rows)}
     </section>
@@ -1639,7 +1684,7 @@ def html_sell_section(sell_rows: List[List[Any]]) -> str:
 
 def html_roll_section(roll_rows: List[List[Any]]) -> str:
     return f"""
-    <section class="section">
+    <section class="section zone-ledger">
       <h2>ROLL候选表</h2>
       {html_table(["平台", "标的", "原合约", "序", "Roll到", "行权价", "DTE", "Delta", "上移", "估算净额", "Roll现金流", "整体P/L"], roll_rows)}
       <p class="muted">估算净额中负数表示净支出，正数表示净收入。</p>
@@ -1649,7 +1694,7 @@ def html_roll_section(roll_rows: List[List[Any]]) -> str:
 
 def html_raw_json_section(raw_json: str) -> str:
     return f"""
-    <section class="section">
+    <section class="section zone-raw" id="zone-raw">
       <details>
         <summary>完整 JSON 原始数据</summary>
         <pre>{html_text(raw_json)}</pre>
@@ -1658,7 +1703,7 @@ def html_raw_json_section(raw_json: str) -> str:
 """
 
 
-def build_html_position_rows(base_positions: List[Dict[str, Any]], short_calls: List[Dict[str, Any]]) -> Dict[str, List[List[Any]]]:
+def build_html_position_rows(base_positions: List[Dict[str, Any]], short_calls: List[Dict[str, Any]], stock_positions: Optional[List[Dict[str, Any]]] = None) -> Dict[str, List[List[Any]]]:
     return {
         "base_rows": [
             [
@@ -1707,6 +1752,16 @@ def build_html_position_rows(base_positions: List[Dict[str, Any]], short_calls: 
             ]
             for item in short_calls
             if item.get("option_type") not in {"CALL", "PUT"}
+        ],
+        "stock_rows": [
+            [
+                item.get("underlying") or (item.get("code") or "-"),
+                item.get("code") or "-",
+                item.get("quantity") or "-",
+                "—",
+                format_value(item.get("cost_price"), 4),
+            ]
+            for item in (stock_positions or [])
         ],
     }
 
