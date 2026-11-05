@@ -432,6 +432,135 @@ def fetch_underlying_iv_overview(symbol: str, ctx: Any) -> Dict[str, Any]:
         return result
 
 
+# Official hard limit of get_earnings_calendar: begin_date/end_date may span at most 7 days.
+OPEND_EARNINGS_MAX_WINDOW_DAYS = 7
+# The endpoint is quote-only; only OpenQuoteContext is used here (never a trade context).
+OPEND_EARNINGS_SECURITY_COLUMNS = ("security", "stock_code", "code")
+OPEND_EARNINGS_DATE_COLUMNS = ("earnings_date", "date")
+OPEND_EARNINGS_PUB_TYPE_MAP = {
+    "BEFORE": "before_market",
+    "AFTER": "after_market",
+    "REGULAR": "intraday",
+}
+
+
+def earnings_symbol_forms(symbol: str) -> set:
+    """Return the accepted security spellings for one symbol (``US.NVDA`` / ``NVDA``)."""
+    text = (safe_text(symbol) or "").upper()
+    if not text:
+        return set()
+    if "." in text:
+        return {text, text.split(".")[-1]}
+    return {text, f"US.{text}"}
+
+
+def pick_opend_earnings_row(data: Any, symbol: str, today: date) -> Optional[Tuple[date, Any]]:
+    """Return the nearest ``(earnings_date, row)`` for *symbol* with date >= *today*."""
+    if not isinstance(data, pd.DataFrame) or data.empty:
+        return None
+    security_column = next((column for column in OPEND_EARNINGS_SECURITY_COLUMNS if column in data.columns), None)
+    date_column = next((column for column in OPEND_EARNINGS_DATE_COLUMNS if column in data.columns), None)
+    if security_column is None or date_column is None:
+        return None
+    forms = earnings_symbol_forms(symbol)
+    best: Optional[Tuple[date, Any]] = None
+    for _, row in data.iterrows():
+        security = safe_text(row.get(security_column))
+        if security is None or security.upper() not in forms:
+            continue
+        parsed = parse_expiry(row.get(date_column))
+        if parsed is None or parsed < today:
+            continue
+        if best is None or parsed < best[0]:
+            best = (parsed, row)
+    return best
+
+
+def fetch_opend_earnings_calendar(symbol: str, ctx: Any, horizon_days: int = 98) -> Dict[str, Any]:
+    """Fetch the next earnings date from Futu OpenD's quote-only earnings calendar.
+
+    Calls the official v10.12 signature
+    ``get_earnings_calendar(market, sort_type=None, begin_date=None, end_date=None, filter_list=None)``
+    with KEYWORD arguments only (a positional call lands the market in the wrong slot and
+    fails silently). Because OpenD caps a single request at a 7-day window, the horizon is
+    scanned in consecutive windows where ``end_date - begin_date`` never exceeds
+    ``OPEND_EARNINGS_MAX_WINDOW_DAYS``; the scan stops when the horizon is covered or a
+    matching row is found. Rows are filtered locally on the security column, accepting both
+    ``US.NVDA`` and bare ``NVDA``, and the nearest date >= today wins.
+
+    This helper never raises and never swallows a failure: RET_ERROR, a malformed payload and
+    any exception all come back as ``status='ERROR'`` with the error text in ``error``.
+    """
+    record: Dict[str, Any] = {
+        "name": "Futu OpenD Earnings Calendar",
+        "source": "futu_opend_earnings",
+        "status": "ERROR",
+        "tier": "primary",
+    }
+    if ctx is None:
+        record["error"] = "missing_quote_context"
+        return record
+
+    try:
+        from futu import RET_OK, Market
+    except Exception as exc:  # pragma: no cover - only when futu is not importable
+        record["error"] = f"{type(exc).__name__}: {exc}"
+        return record
+
+    today = date.today()
+    windows_scanned = 0
+    try:
+        horizon = max(int(horizon_days), 1)
+        record["horizon_days"] = horizon
+        latest_day = today + timedelta(days=horizon - 1)
+        window_start = today
+        for _ in range(horizon // OPEND_EARNINGS_MAX_WINDOW_DAYS + 2):
+            if window_start > latest_day:
+                break
+            window_end = min(
+                window_start + timedelta(days=OPEND_EARNINGS_MAX_WINDOW_DAYS - 1),
+                latest_day,
+            )
+            ret, data = ctx.get_earnings_calendar(
+                market=Market.US,
+                begin_date=window_start.isoformat(),
+                end_date=window_end.isoformat(),
+            )
+            windows_scanned += 1
+            if ret != RET_OK:
+                record["windows_scanned"] = windows_scanned
+                record["error"] = format_futu_error(ret, data)
+                return record
+            found = pick_opend_earnings_row(data, symbol, today)
+            if found is not None:
+                found_date, row = found
+                pub_type = safe_text(row.get("pub_type")) if "pub_type" in getattr(row, "index", []) else None
+                mapped_time = OPEND_EARNINGS_PUB_TYPE_MAP.get((pub_type or "").upper())
+                record.update(
+                    {
+                        "status": "OK",
+                        "ticker": (safe_text(symbol) or "").upper(),
+                        "next_earnings_date": found_date.isoformat(),
+                        "days_to_earnings": (found_date - today).days,
+                        "time_of_day": mapped_time,
+                        "pub_type": pub_type,
+                        "confirmation_status": "opend",
+                        "windows_scanned": windows_scanned,
+                        "window_begin": window_start.isoformat(),
+                        "window_end": window_end.isoformat(),
+                    }
+                )
+                return record
+            window_start = window_end + timedelta(days=1)
+        record["windows_scanned"] = windows_scanned
+        record["error"] = f"no earnings date for {symbol} within {record['horizon_days']} days"
+        return record
+    except Exception as exc:
+        record["windows_scanned"] = windows_scanned
+        record["error"] = f"{type(exc).__name__}: {exc}"
+        return record
+
+
 def estimate_historical_volatility(symbol: str, ctx: Any, bars: int = 31) -> Optional[float]:
     data = get_daily_klines(symbol, ctx, bars)
     if data.empty or "close" not in data.columns or len(data) < 8:

@@ -6,7 +6,18 @@ import urllib.request
 from datetime import date
 from typing import Any, Dict, List, Optional
 
+from pmcc.data_futu import fetch_opend_earnings_calendar
 from pmcc.utils import parse_expiry, safe_float, safe_int, safe_text, symbol_to_web_ticker
+
+
+TIER_PRIMARY = "primary"
+TIER_CHECK = "check"
+TIER_EVENT = "event"
+TIER_MANUAL = "manual"
+
+# Sources whose earnings date is human-verified / machine-authoritative.
+MANUAL_CONFIRMED_SOURCE = "manual_confirmed"
+WEB_AGREED_SOURCE = "web_agreed"
 
 
 def http_get_text(url: str, timeout: float = 5.0) -> str:
@@ -46,6 +57,7 @@ def build_earnings_source_record(
         "url": url,
         "status": "ERROR",
         "ticker": ticker.upper(),
+        "tier": TIER_EVENT,
     }
     if parsed_date is None:
         record["error"] = "earnings date not found"
@@ -72,6 +84,7 @@ def fetch_yahoo_finance_quote(symbol: str) -> Dict[str, Any]:
         "source": "yahoo_finance",
         "url": human_url,
         "status": "ERROR",
+        "tier": TIER_CHECK,
     }
     try:
         payload = json.loads(http_get_text(api_url))
@@ -108,6 +121,7 @@ def fetch_next_earnings_date(symbol: str) -> Dict[str, Any]:
         "source": "next_earnings_date",
         "url": url,
         "status": "ERROR",
+        "tier": TIER_EVENT,
     }
     try:
         page = http_get_text(url)
@@ -238,6 +252,11 @@ def fetch_wallstreethorizon_earnings_date(symbol: str) -> Dict[str, Any]:
 
 
 def choose_primary_earnings_source(records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Legacy pick-earliest helper, kept for the web-only fallback display path.
+
+    The primary/confirmed decision is made by :func:`resolve_earnings_primary`; this
+    function intentionally does NOT decide whether the date may hard-block trading.
+    """
     usable = [
         record
         for record in records
@@ -256,7 +275,186 @@ def choose_primary_earnings_source(records: List[Dict[str, Any]]) -> Optional[Di
     return usable[0]
 
 
-def build_market_data_validation(symbol: str, futu_price: Optional[float], enabled: bool = True) -> Dict[str, Any]:
+def earnings_record_date(record: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Return the ISO date of a usable earnings record, else None."""
+    if not record or record.get("status") != "OK":
+        return None
+    days = safe_int(record.get("days_to_earnings"))
+    if days is None or days < 0:
+        return None
+    text = safe_text(record.get("next_earnings_date"))
+    if text is None:
+        return None
+    return text[:10]
+
+
+def manual_earnings_record(event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Turn one local event-calendar entry into an earnings source record."""
+    if not isinstance(event, dict):
+        return None
+    record_date = safe_text(event.get("date")) or safe_text(event.get("event_date"))
+    days = safe_int(event.get("days_to_event"))
+    if days is None:
+        parsed = parse_expiry(record_date)
+        if parsed is None:
+            return None
+        days = (parsed - date.today()).days
+        record_date = parsed.isoformat()
+    if record_date is None:
+        return None
+    source = safe_text(event.get("source")) or "local_event_calendar"
+    manual_confirmed = source.lower() == MANUAL_CONFIRMED_SOURCE and days >= 0
+    return {
+        "name": "Local Event Calendar (manual confirmed)" if manual_confirmed else "Local Event Calendar",
+        "source": source,
+        "status": "OK",
+        "tier": TIER_MANUAL,
+        "next_earnings_date": record_date[:10],
+        "days_to_earnings": days,
+        "time_of_day": safe_text(event.get("time")) or safe_text(event.get("time_of_day")),
+        "confirmation_status": "manual_confirmed" if manual_confirmed else "manual_unconfirmed",
+        "manual_confirmed": manual_confirmed,
+    }
+
+
+def build_manual_earnings_records(events: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        if str(event.get("type") or "event").lower() != "earnings":
+            continue
+        record = manual_earnings_record(event)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def candidate_date_entry(record: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "source": record.get("source"),
+        "name": record.get("name"),
+        "tier": record.get("tier"),
+        "date": earnings_record_date(record),
+        "days_to_earnings": safe_int(record.get("days_to_earnings")),
+        "time_of_day": record.get("time_of_day"),
+        "confirmation_status": record.get("confirmation_status"),
+    }
+
+
+def resolve_earnings_primary(
+    opend_record: Optional[Dict[str, Any]],
+    web_records: List[Dict[str, Any]],
+    manual_records: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Choose the primary earnings date and decide whether it is confirmed.
+
+    Precedence:
+      1. a usable Futu OpenD earnings-calendar record is primary (confirmed),
+      2. else two agreeing web sources are primary, marked ``web_agreed`` (confirmed),
+      3. else a date is still shown for display but ``confirmed`` stays False
+         (a human-verified ``manual_confirmed`` entry is the one exception - it counts).
+    ``source_conflict`` is True when the OpenD date differs from any OK web date, or when
+    the two web sources disagree; every candidate date is returned for the report.
+    """
+    manual_records = manual_records or []
+    opend_date = earnings_record_date(opend_record)
+    web_ok = [record for record in web_records if earnings_record_date(record) is not None]
+    web_dates = [earnings_record_date(record) for record in web_ok]
+    unique_web_dates = sorted({value for value in web_dates if value})
+    manual_ok = [record for record in manual_records if earnings_record_date(record) is not None]
+
+    source_conflict = False
+    if opend_date is not None and any(value != opend_date for value in web_dates):
+        source_conflict = True
+    if len(unique_web_dates) > 1:
+        source_conflict = True
+
+    primary: Optional[Dict[str, Any]] = None
+    confirmed = False
+    if opend_date is not None and opend_record is not None:
+        primary = dict(opend_record)
+        primary["tier"] = primary.get("tier") or TIER_PRIMARY
+        primary["primary_reason"] = "opend"
+        confirmed = True
+    elif len(web_ok) >= 2 and len(unique_web_dates) == 1:
+        base = choose_primary_earnings_source(web_ok) or web_ok[0]
+        primary = dict(base)
+        primary["source"] = WEB_AGREED_SOURCE
+        primary["name"] = "Web sources agreed"
+        primary["confirmation_status"] = WEB_AGREED_SOURCE
+        primary["agreed_sources"] = [
+            {"source": record.get("source"), "name": record.get("name"), "date": earnings_record_date(record)}
+            for record in web_ok
+        ]
+        primary["primary_reason"] = WEB_AGREED_SOURCE
+        confirmed = True
+    else:
+        web_primary = choose_primary_earnings_source(web_ok)
+        manual_primary = None
+        if manual_ok:
+            manual_sorted = sorted(
+                manual_ok,
+                key=lambda item: (
+                    0 if item.get("manual_confirmed") else 1,
+                    safe_int(item.get("days_to_earnings")) or 999999,
+                ),
+            )
+            manual_primary = manual_sorted[0]
+        if web_primary is not None:
+            primary = dict(web_primary)
+            primary_date = earnings_record_date(primary)
+            manual_support = [
+                record
+                for record in manual_ok
+                if record.get("manual_confirmed") and earnings_record_date(record) == primary_date
+            ]
+            if manual_support:
+                # A single web source is unconfirmed unless a human-verified local
+                # entry backs the exact same date.
+                primary["primary_reason"] = "web_supported_by_manual_confirmed"
+                primary["manual_confirmed_support"] = True
+                confirmed = True
+            else:
+                primary["primary_reason"] = "web_unconfirmed"
+                confirmed = False
+        elif manual_primary is not None:
+            primary = dict(manual_primary)
+            primary["primary_reason"] = "manual_confirmed" if manual_primary.get("manual_confirmed") else "manual_unconfirmed"
+            confirmed = bool(manual_primary.get("manual_confirmed"))
+
+    candidates = [candidate_date_entry(record) for record in ([opend_record] if opend_record else []) + web_ok + manual_ok]
+    conflict_dates = [
+        entry
+        for entry in candidates
+        if entry.get("date")
+        and str(entry.get("tier")) in {TIER_PRIMARY, TIER_EVENT}
+    ] if source_conflict else []
+
+    return {
+        "primary": primary,
+        "confirmed": confirmed,
+        "source_conflict": source_conflict,
+        "candidate_dates": [entry for entry in candidates if entry.get("date")],
+        "conflict_dates": conflict_dates,
+    }
+
+
+def build_market_data_validation(
+    symbol: str,
+    futu_price: Optional[float],
+    enabled: bool = True,
+    quote_ctx: Optional[Any] = None,
+    manual_events: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Validate Futu market data against independent sources.
+
+    *quote_ctx* is optional: opend mode passes the live ``OpenQuoteContext`` so the
+    quote-only Futu earnings calendar can act as the primary earnings source, while
+    CBOE/CSV modes and existing callers keep working unchanged without it.
+    *manual_events* are local event-calendar entries (human input) used for display and
+    for the confirmed/unconfirmed decision only.
+    """
     validation: Dict[str, Any] = {
         "enabled": enabled,
         "primary_source": "Futu OpenD",
@@ -268,13 +466,29 @@ def build_market_data_validation(symbol: str, futu_price: Optional[float], enabl
         return validation
 
     yahoo = fetch_yahoo_finance_quote(symbol)
-    earnings_sources = [
+    yahoo.setdefault("tier", TIER_CHECK)
+    web_earnings_sources = [
         fetch_next_earnings_date(symbol),
         fetch_wallstreethorizon_earnings_date(symbol),
     ]
-    earnings = choose_primary_earnings_source(earnings_sources)
-    validation["sources"] = [yahoo] + earnings_sources
-    validation["earnings_sources"] = earnings_sources
+    for record in web_earnings_sources:
+        record.setdefault("tier", TIER_EVENT)
+    opend_earnings: Optional[Dict[str, Any]] = None
+    if quote_ctx is not None:
+        opend_earnings = fetch_opend_earnings_calendar(symbol, quote_ctx)
+        opend_earnings.setdefault("tier", TIER_PRIMARY)
+    manual_earnings = build_manual_earnings_records(manual_events)
+    resolution = resolve_earnings_primary(opend_earnings, web_earnings_sources, manual_earnings)
+    earnings = resolution["primary"]
+
+    sources: List[Dict[str, Any]] = [yahoo]
+    if opend_earnings is not None:
+        sources.append(opend_earnings)
+    sources.extend(web_earnings_sources)
+    sources.extend(manual_earnings)
+    validation["sources"] = sources
+    validation["earnings_sources"] = ([opend_earnings] if opend_earnings is not None else []) + web_earnings_sources + manual_earnings
+    validation["opend_earnings"] = opend_earnings
 
     yahoo_price = safe_float(yahoo.get("price"))
     if futu_price is not None and yahoo_price is not None:
@@ -312,14 +526,26 @@ def build_market_data_validation(symbol: str, futu_price: Optional[float], enabl
             "source": earnings.get("source"),
             "source_name": earnings.get("name"),
             "confirmation_status": earnings.get("confirmation_status"),
+            "primary_reason": earnings.get("primary_reason"),
+            "confirmed": bool(resolution["confirmed"]),
+            "source_conflict": bool(resolution["source_conflict"]),
+            "candidate_dates": resolution["candidate_dates"],
+            "conflict_dates": resolution["conflict_dates"],
             "warning": warning,
         }
     else:
         errors = [
             f"{item.get('source')}: {item.get('error') or item.get('status')}"
-            for item in earnings_sources
+            for item in validation["earnings_sources"]
             if item.get("status") != "OK"
         ]
-        validation["earnings_check"] = {"status": "UNAVAILABLE", "error": " | ".join(errors) if errors else "earnings date not found"}
+        validation["earnings_check"] = {
+            "status": "UNAVAILABLE",
+            "error": " | ".join(errors) if errors else "earnings date not found",
+            "confirmed": False,
+            "source_conflict": bool(resolution["source_conflict"]),
+            "candidate_dates": resolution["candidate_dates"],
+            "conflict_dates": resolution["conflict_dates"],
+        }
 
     return validation

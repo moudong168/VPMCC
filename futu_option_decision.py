@@ -250,13 +250,23 @@ def load_local_event_records(symbol: str) -> List[Dict[str, Any]]:
         event_date = parse_expiry(item.get("date") or item.get("event_date") or item.get("ex_dividend_date"))
         if event_date is None:
             continue
+        days_to_event = (event_date - date.today()).days
+        # A local entry only counts as confirmed when it was explicitly human-verified
+        # (source='manual_confirmed') and still lies in the future.
+        manual_source = safe_text(item.get("source")) or "local_event_calendar"
+        manual_confirmed = manual_source.lower() == "manual_confirmed" and days_to_event >= 0
         records.append(
             {
                 "type": safe_text(item.get("type")) or "event",
                 "date": event_date.isoformat(),
                 "days_to_event": (event_date - date.today()).days,
                 "description": safe_text(item.get("description")) or safe_text(item.get("name")),
-                "source": "local_event_calendar",
+                "source": manual_source,
+                "confirmation_status": "manual_confirmed" if manual_confirmed else "manual_unconfirmed",
+                "confirmed": manual_confirmed,
+                "tier": "manual",
+                "time_of_day": safe_text(item.get("time")) or safe_text(item.get("time_of_day")),
+                "updated_at": safe_text(item.get("updated_at")),
             }
         )
     return records
@@ -279,6 +289,27 @@ def extract_ex_dividend_event(quote: pd.Series) -> Optional[Dict[str, Any]]:
     return None
 
 
+def event_is_confirmed(event: Dict[str, Any]) -> bool:
+    """Whether an event may hard-block new short calls.
+
+    Only confirmed earnings sources (Futu OpenD calendar, agreeing web sources, a
+    human-verified ``manual_confirmed`` entry) may block. A record without any
+    confirmation flag keeps the legacy blocking behaviour, so callers that build a
+    validation dict by hand are unaffected.
+    """
+    if not isinstance(event, dict):
+        return True
+    value = event.get("confirmed")
+    if isinstance(value, bool):
+        return value
+    source = str(event.get("source") or "").lower()
+    if source == "manual_confirmed":
+        return True
+    if source in {"local_event_calendar", "manual", "manual_input", "manual_override"}:
+        return False
+    return True
+
+
 def build_event_risk_block(
     symbol: str,
     quote: pd.Series,
@@ -289,6 +320,9 @@ def build_event_risk_block(
     earnings = validation.get("earnings_check") or {}
     earnings_days = safe_int(earnings.get("days_to_earnings"))
     if earnings_days is not None and earnings.get("next_earnings_date"):
+        earnings_confirmed = earnings.get("confirmed")
+        if not isinstance(earnings_confirmed, bool):
+            earnings_confirmed = True
         events.append(
             {
                 "type": "earnings",
@@ -298,12 +332,25 @@ def build_event_risk_block(
                 "source": earnings.get("source") or "market_data_validation",
                 "source_name": earnings.get("source_name"),
                 "confirmation_status": earnings.get("confirmation_status"),
+                "confirmed": earnings_confirmed,
+                "source_conflict": bool(earnings.get("source_conflict")),
+                "candidate_dates": earnings.get("candidate_dates") or [],
             }
         )
     ex_dividend = extract_ex_dividend_event(quote)
     if ex_dividend:
         events.append(ex_dividend)
-    events.extend(load_local_event_records(symbol))
+    primary_earnings_date = safe_text(earnings.get("next_earnings_date"))
+    for local_event in load_local_event_records(symbol):
+        # The earnings_check event above already carries the primary date (which may itself
+        # come from the local calendar); skip the duplicate local copy of the same date.
+        if (
+            str(local_event.get("type") or "").lower() == "earnings"
+            and primary_earnings_date
+            and local_event.get("date") == primary_earnings_date
+        ):
+            continue
+        events.append(local_event)
 
     blocking_events: List[Dict[str, Any]] = []
     attention_events: List[Dict[str, Any]] = []
@@ -315,6 +362,14 @@ def build_event_risk_block(
         block_days = config.event_block_days
         if event_type == "earnings":
             block_days = config.earnings_block_days
+            if not event_is_confirmed(event):
+                # Unconfirmed earnings dates are downgraded to a visible warning; they
+                # never activate the 'no new short calls' hard block.
+                event["warning_only"] = True
+                event["warning"] = event.get("warning") or "unconfirmed earnings date; warning only, no hard block"
+                if days <= max(config.event_block_days, config.earnings_block_days, 35):
+                    attention_events.append(event)
+                continue
         elif event_type in {"ex_dividend", "ex-dividend", "ex_div"}:
             block_days = config.ex_dividend_block_days
         if days <= block_days:
@@ -3391,7 +3446,13 @@ def decision_engine(
                 "is_decision_usable_iv_rank": True,
                 "priority": "interactive_manual_override",
             }
-        data_validation = build_market_data_validation(symbol, stock_price, config.enable_web_validation)
+        data_validation = build_market_data_validation(
+            symbol,
+            stock_price,
+            config.enable_web_validation,
+            quote_ctx=ctx,
+            manual_events=load_local_event_records(symbol),
+        )
         event_block = build_event_risk_block(symbol, quote, data_validation, config)
 
         selected = select_option(enriched, config)
@@ -4003,6 +4064,7 @@ def build_pmcc_two_stage_result(
 
     return {
         "mode": "pmcc_two_stage",
+        "data_mode": "cboe" if use_cboe else "opend",
         "position_source": source_metadata,
         "recorded_positions": {
             "base_positions": [position_to_record(item) for item in base_positions],
@@ -4063,6 +4125,7 @@ def build_pmcc_multi_portfolio_result(
 
     return {
         "mode": "pmcc_two_stage_multi_portfolio",
+        "data_mode": "cboe" if use_cboe else "opend",
         "position_source": {
             **source_metadata,
             "portfolio_isolation": "broker_account",
@@ -4155,16 +4218,39 @@ def run_pmcc_csv(config: StrategyConfig, csv_dir: Path) -> Dict[str, Any]:
     print_broker_position_confirmation("Futu (CSV)", futu_base_positions, futu_short_calls, futu_csv_meta)
     print_broker_position_confirmation("Schwab (CSV)", schwab_base_positions, schwab_short_calls, schwab_csv_meta)
 
+    def _csv_file_record(broker: str, meta: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        # Only report a file when this run really consumed a CSV export; a reused
+        # saved snapshot keeps its JSON path and must not be shown as a CSV file.
+        name = safe_text(meta.get("csv_file"))
+        if not name and meta.get("csv_mode") == "loaded_from_csv":
+            path_text = safe_text(meta.get("path"))
+            name = Path(path_text).name if path_text else None
+        if not name:
+            return None
+        file_date = None
+        path_text = safe_text(meta.get("path"))
+        if path_text:
+            try:
+                file_date = datetime.fromtimestamp(Path(path_text).stat().st_mtime).strftime("%Y-%m-%d")
+            except OSError:
+                file_date = None
+        return {"broker": broker, "file": name, "date": file_date}
+
     metadata = {
         "source": "csv_positions_no_opend",
         "analysis_policy": "broker_account_isolated",
         "csv_dir": str(csv_dir),
         "futu": futu_csv_meta,
         "schwab": schwab_csv_meta,
+        "csv_files": [
+            record
+            for record in (_csv_file_record("Futu", futu_csv_meta), _csv_file_record("Schwab", schwab_csv_meta))
+            if record is not None
+        ],
         "total_base_contracts": sum(item.quantity for item in futu_base_positions) + sum(item.quantity for item in schwab_base_positions),
         "total_short_contracts": sum(item.quantity for item in futu_short_calls) + sum(item.quantity for item in schwab_short_calls),
     }
-    return build_pmcc_multi_portfolio_result(
+    result = build_pmcc_multi_portfolio_result(
         metadata,
         [
             {
@@ -4185,12 +4271,14 @@ def run_pmcc_csv(config: StrategyConfig, csv_dir: Path) -> Dict[str, Any]:
         config,
         use_cboe=use_cboe,
     )
+    # Positions come from CSV exports (market data is CBOE delayed); mark it for the report banner.
+    result["data_mode"] = "csv"
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Schwab Position Statement auto-discovery for opend mode
 # ---------------------------------------------------------------------------
-
 # Separate from the csv-mode "schwab" key so opend runs do not consume csv-mode state.
 SCHWAB_OPEND_CSV_STATE_KEY = "schwab_opend"
 

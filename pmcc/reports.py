@@ -7,6 +7,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pmcc.utils import safe_float, safe_int, safe_text
 
+# Data-source tier labels shown next to every validation source record.
+TIER_LABELS = {
+    "primary": "[主源]",
+    "check": "[校验]",
+    "event": "[事件]",
+    "manual": "[手输]",
+}
+CBOE_DELAY_WARNING = "注意: 本报告基于 CBOE 延迟数据 (约15分钟)"
+OPEND_BANNER_TEXT = "数据源: Futu OpenD 实时 (主源) · Yahoo 校验 · 财报日期 OpenD 日历优先"
+CBOE_BANNER_TEXT = "数据源: CBOE 延迟行情 (主源) · Yahoo 校验 · 财报日期 OpenD 日历优先"
+
 
 def write_report_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
@@ -297,6 +308,10 @@ def summarize_data_validation(validation: Dict[str, Any]) -> str:
     parts.append(f"earnings {earnings.get('status', 'SKIPPED')}")
     if earnings.get("next_earnings_date"):
         parts.append(f"{earnings.get('next_earnings_date')} ({earnings.get('days_to_earnings')}d)")
+    if earnings.get("confirmed") is False:
+        parts.append("earnings unconfirmed (warning only)")
+    if earnings.get("source_conflict"):
+        parts.append("earnings date conflict between sources")
     return "; ".join(parts)
 
 
@@ -363,6 +378,13 @@ def summarize_event_block(event_block: Dict[str, Any]) -> str:
     attention = event_block.get("attention_events") or []
     if attention:
         first = attention[0]
+        if first.get("warning_only"):
+            source = first.get("source_name") or first.get("source")
+            source_text = f" from {source}" if source else ""
+            return (
+                f"WARNING (unconfirmed): {first.get('type')} in {first.get('days_to_event')}d{source_text}; "
+                "event gate does not block new short calls"
+            )
         return f"{first.get('type')} in {first.get('days_to_event')}d; size conservatively"
     return "no near-term event block"
 
@@ -755,6 +777,9 @@ def format_symbol_human(symbol_result: Dict[str, Any], position_result: Optional
     event_block = position_result.get("event_block") or symbol_result.get("event_block") or {}
     if event_block:
         lines.append(f"事件窗口检查：{summarize_event_block(event_block)}。")
+    earnings_conflict_note = format_earnings_conflict_note(validation.get("earnings_check") or {}) if validation else ""
+    if earnings_conflict_note:
+        lines.append(earnings_conflict_note + "。")
     long_leg_analysis = position_result.get("long_leg_analysis") or {}
     if long_leg_analysis:
         lines.append(format_long_leg_expiry_summary(long_leg_analysis))
@@ -936,6 +961,7 @@ def build_html_report(
 
     raw_json = json.dumps(result, indent=2, ensure_ascii=False, default=str)
     css = html_report_css()
+    data_source_banner = format_data_source_banner(result)
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -947,7 +973,7 @@ def build_html_report(
 </head>
 <body>
   <main class="report-shell">
-    {html_report_header(generated_at, report_version, source, len(recommendations))}
+    {html_report_header(generated_at, report_version, source, len(recommendations), data_source_banner)}
 
     {position_sections}
 
@@ -1002,9 +1028,10 @@ def html_symbol_detail_card(recommendation: Dict[str, Any], position: Dict[str, 
     event_class = event_risk_class(event_block)
     validation_class = validation_risk_class(validation)
     validation_items = "".join(
-        f"<li>{html_text((item.get('name') or item.get('source')) + ': ' + str(item.get('status')) + (' - ' + str(item.get('error')) if item.get('error') else ''))}</li>"
+        f"<li>{html_text(validation_source_line(item))}</li>"
         for item in validation.get("sources", [])
     ) or "<li>无备用数据源记录。</li>"
+    earnings_conflict_note = html_earnings_conflict_note(validation.get("earnings_check") or {})
     return f"""
             <section class="card">
               <h2>{html_text(portfolio)} · {html_text(symbol)}</h2>
@@ -1031,8 +1058,131 @@ def html_symbol_detail_card(recommendation: Dict[str, Any], position: Dict[str, 
               <ul>{validation_items}</ul>
               <h3>{html_text(symbol)} 事件窗口检查</h3>
               <p class="event-banner {event_class}">{html_text(event_summary)}</p>
+              {earnings_conflict_note}
             </section>
             """
+
+
+def tier_label(tier: Any) -> str:
+    """Return the report label for a data-source tier (empty for unknown)."""
+    return TIER_LABELS.get(str(tier or "").strip().lower(), "")
+
+
+def validation_source_line(item: Dict[str, Any]) -> str:
+    label = tier_label(item.get("tier"))
+    name = item.get("name") or item.get("source") or "-"
+    status = str(item.get("status"))
+    error = f" - {item.get('error')}" if item.get("error") else ""
+    return f"{label} {name}: {status}{error}".strip()
+
+
+def resolve_data_mode(result: Dict[str, Any]) -> str:
+    """Resolve the data mode (opend / cboe / csv) for the report banner."""
+    result = result or {}
+    for key in ("data_mode", "market_data_mode", "quote_mode", "data_source_mode"):
+        mode = str(result.get(key) or "").strip().lower()
+        if mode in {"opend", "cboe", "csv"}:
+            return mode
+    source = result.get("position_source") or {}
+    if isinstance(source, dict):
+        for key in ("data_mode", "quote_mode"):
+            mode = str(source.get(key) or "").strip().lower()
+            if mode in {"opend", "cboe", "csv"}:
+                return mode
+        if source.get("use_cboe") is True or str(source.get("quote_source") or "").lower() == "cboe":
+            return "cboe"
+        if "csv" in str(source.get("source") or "").lower():
+            return "csv"
+        if "cboe" in str(source.get("source") or "").lower():
+            return "cboe"
+    if result.get("use_cboe") is True:
+        return "cboe"
+    for analysis in result.get("stage_1_position_analysis") or []:
+        if isinstance(analysis, dict) and str(analysis.get("quote_source") or "").lower() == "cboe":
+            return "cboe"
+    return "opend"
+
+
+def csv_positions_banner_text(result: Dict[str, Any]) -> str:
+    source = (result or {}).get("position_source") or {}
+    records = source.get("csv_files") or []
+    parts: List[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        name = safe_text(record.get("file"))
+        if not name:
+            continue
+        date_text = safe_text(record.get("date"))
+        broker = safe_text(record.get("broker")) or "CSV"
+        parts.append(f"{broker}: {name}{' (' + date_text + ')' if date_text else ''}")
+    if not parts:
+        for broker in ("futu", "schwab"):
+            meta = source.get(broker) or {}
+            if not isinstance(meta, dict):
+                continue
+            name = safe_text(meta.get("csv_file"))
+            if not name:
+                continue
+            path_text = safe_text(meta.get("path"))
+            date_text = None
+            if path_text:
+                try:
+                    date_text = datetime.fromtimestamp(Path(path_text).stat().st_mtime).strftime("%Y-%m-%d")
+                except OSError:
+                    date_text = None
+            parts.append(f"{broker.upper()}: {name}{' (' + date_text + ')' if date_text else ''}")
+    if parts:
+        return "CSV 持仓文件 (" + "; ".join(parts) + ")"
+    return "CSV 持仓文件 (未找到新 CSV，使用已保存持仓快照)"
+
+
+def format_data_source_banner(result: Dict[str, Any]) -> str:
+    """HTML data-source banner for the report header."""
+    mode = resolve_data_mode(result)
+    if mode == "cboe":
+        return (
+            f'<p class="source-banner">{html_text(CBOE_BANNER_TEXT)} '
+            f'<strong class="source-warning">{html_text(CBOE_DELAY_WARNING)}</strong></p>'
+        )
+    if mode == "csv":
+        text = f"数据源: {csv_positions_banner_text(result)} · CBOE 延迟行情"
+        return (
+            f'<p class="source-banner">{html_text(text)} '
+            f'<strong class="source-warning">{html_text(CBOE_DELAY_WARNING)}</strong></p>'
+        )
+    return f'<p class="source-banner">{html_text(OPEND_BANNER_TEXT)}</p>'
+
+
+def format_earnings_conflict_note(earnings_check: Dict[str, Any]) -> str:
+    """Plain-text note listing the differing earnings dates and their sources."""
+    if not earnings_check or not earnings_check.get("source_conflict"):
+        return ""
+    entries = earnings_check.get("conflict_dates") or earnings_check.get("candidate_dates") or []
+    parts: List[str] = []
+    for item in entries:
+        if not isinstance(item, dict) or not item.get("date"):
+            continue
+        source = item.get("name") or item.get("source") or "unknown"
+        label = tier_label(item.get("tier"))
+        parts.append(f"{item.get('date')} 来自 {source}" + (f" {label}" if label else ""))
+    note = "财报日期来源冲突: " + ("; ".join(parts) if parts else "各来源日期不一致")
+    primary_date = earnings_check.get("next_earnings_date")
+    if primary_date:
+        primary_source = earnings_check.get("source_name") or earnings_check.get("source") or "primary"
+        note += f"。当前主源使用 {primary_date} ({primary_source})"
+    return note
+
+
+def html_earnings_conflict_note(earnings_check: Dict[str, Any]) -> str:
+    note = format_earnings_conflict_note(earnings_check)
+    if not note:
+        return ""
+    return f'<p class="conflict-note">{html_text(note)}</p>'
+
+
+# Friendly alias kept for callers/tests that use the short name.
+data_source_banner = format_data_source_banner
 
 
 def html_report_header(
@@ -1040,13 +1190,18 @@ def html_report_header(
     report_version: Dict[str, str],
     source: Dict[str, Any],
     recommendation_count: int,
+    data_source_banner: Optional[str] = None,
+    data_mode: Optional[str] = None,
 ) -> str:
+    if data_source_banner is None and data_mode:
+        data_source_banner = format_data_source_banner({"data_mode": data_mode})
     return f"""
     <header>
       <div>
         <h1>PMCC 交易报告</h1>
         <div class="subtitle">生成时间：{html_text(generated_at)}</div>
         <div class="subtitle">分支：{html_text(report_version.get("branch"))}；版本：{html_text(report_version.get("version"))}</div>
+        {data_source_banner or ""}
       </div>
       <div class="kpis">
         <div class="kpi"><span>底仓合约</span><strong>{html_value(source.get("total_base_contracts"), 0)}</strong></div>
@@ -1123,6 +1278,27 @@ def html_report_css() -> str:
       text-transform:uppercase;
     }
     .subtitle, .muted { color:var(--muted); }
+    .source-banner {
+      margin:12px 0 0;
+      padding:9px 12px;
+      border:1px solid rgba(36,99,235,.22);
+      border-radius:6px;
+      background:rgba(255,255,255,.82);
+      color:#173f91;
+      font-size:13px;
+      font-weight:650;
+      line-height:1.5;
+    }
+    .source-warning { color:var(--red); font-weight:800; }
+    .conflict-note {
+      margin:10px 0 0;
+      padding:10px 12px;
+      border:1px solid rgba(180,35,24,.32);
+      border-radius:6px;
+      background:var(--red-bg);
+      color:var(--red);
+      font-weight:750;
+    }
     .subtitle { font-size:13px; line-height:1.7; }
     .kpis { display:grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap:12px; min-width:0; }
     .kpi {
